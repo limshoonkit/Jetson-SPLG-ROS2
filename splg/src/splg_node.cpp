@@ -15,15 +15,26 @@
 
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
-#include "opencv2/cudawarping.hpp"
+#include <opencv2/core/cuda_stream_accessor.hpp>
+#include <opencv2/cudawarping.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudaarithm.hpp>
 
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
+#include <cuda_runtime_api.h>
 #include "type_conv_helper.cuh"
 
 using namespace nvinfer1;
+
+inline void checkCuda(const char *where)
+{
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        std::cerr << "CUDA error after " << where << ": " << cudaGetErrorString(err) << std::endl;
+    }
+}
 
 // https://github.com/NVIDIA/TensorRT/issues/4120
 class DynamicOutputAllocator : public nvinfer1::IOutputAllocator
@@ -39,7 +50,6 @@ public:
         }
     }
 
-    // FIX: Removed unused parameter name to silence warning
     void notifyShape(const char * /*tensorName*/, const nvinfer1::Dims &dims) noexcept override
     {
         mShape = dims;
@@ -110,12 +120,12 @@ public:
         if (!initTensorRT())
         {
             RCLCPP_ERROR(get_logger(), "Failed to initialize TensorRT");
+            rclcpp::shutdown();
             return;
         }
 
         discoverTensorNames();
         allocateBuffers();
-
         setupBindingsAndAllocators();
 
         if (use_gpu_preprocessing_)
@@ -154,10 +164,10 @@ private:
 
     // GPU memory buffers
     void *d_input_;
-    void *d_output_keypoints_fp16_; // Direct FP16 output from TensorRT
-    void *d_output_keypoints_fp32_; // Buffer for converted FP32 keypoints
+    void *d_temp_input_fp32_;
+    void *d_output_keypoints_fp16_;
+    void *d_output_keypoints_fp32_;
 
-    // Map to manage the lifetime of dynamic allocator objects
     std::unordered_map<std::string, std::unique_ptr<DynamicOutputAllocator>> mAllocatorMap;
 
     // Host memory buffers
@@ -165,11 +175,10 @@ private:
     std::vector<int> h_matches_;
     std::vector<float> h_scores_;
 
-    cv::cuda::GpuMat gpu_left_, gpu_right_;
+    // GPU Preprocessing Mats
     cv::cuda::GpuMat gpu_left_resized_, gpu_right_resized_;
     cv::cuda::GpuMat gpu_left_gray_, gpu_right_gray_;
     cv::cuda::GpuMat gpu_left_norm_, gpu_right_norm_;
-    cv::cuda::GpuMat gpu_batch_;
 
     std::string engine_path_;
     int input_height_, input_width_;
@@ -182,9 +191,9 @@ private:
     int frame_skip_n_;
     double max_process_rate_hz_;
 
-    std::atomic<bool> processing_;
+    std::atomic<bool> processing_{false};
     std::chrono::steady_clock::time_point last_process_time_;
-    int frame_counter_;
+    int frame_counter_{0};
 
     std::string input_tensor_name_;
     std::string output_keypoints_name_;
@@ -208,6 +217,56 @@ private:
         }
     } gLogger;
 
+    // Helper for CPU-based float to FP16 conversion
+    static uint16_t float_to_half_bits(float f)
+    {
+        union
+        {
+            float f_val;
+            uint32_t u_val;
+        } converter;
+        converter.f_val = f;
+        uint32_t u = converter.u_val;
+
+        uint32_t sign = (u >> 31) & 0x0001;
+        uint32_t exp = (u >> 23) & 0x00ff;
+        uint32_t mant = u & 0x007fffff;
+
+        uint16_t h_sign = sign << 15;
+        uint16_t h_exp, h_mant;
+
+        if (exp == 0)
+        {
+            h_exp = 0;
+            h_mant = 0;
+        }
+        else if (exp == 255)
+        {
+            h_exp = 0x1f;
+            h_mant = (mant == 0) ? 0 : 0x0200;
+        }
+        else
+        {
+            int16_t new_exp = exp - 127;
+            if (new_exp < -14)
+            {
+                h_exp = 0;
+                h_mant = 0;
+            }
+            else if (new_exp > 15)
+            {
+                h_exp = 0x1f;
+                h_mant = 0;
+            }
+            else
+            {
+                h_exp = new_exp + 15;
+                h_mant = mant >> 13;
+            }
+        }
+        return h_sign | (h_exp << 10) | h_mant;
+    }
+
     bool initTensorRT()
     {
         runtime_ = std::unique_ptr<IRuntime>(createInferRuntime(gLogger));
@@ -228,8 +287,7 @@ private:
         std::vector<char> engine_data(size);
         file.read(engine_data.data(), size);
 
-        engine_ = std::unique_ptr<ICudaEngine>(
-            runtime_->deserializeCudaEngine(engine_data.data(), size));
+        engine_ = std::unique_ptr<ICudaEngine>(runtime_->deserializeCudaEngine(engine_data.data(), size));
         if (!engine_)
             return false;
 
@@ -244,29 +302,10 @@ private:
     void discoverTensorNames()
     {
         int32_t nbIOTensors = engine_->getNbIOTensors();
-        RCLCPP_INFO(this->get_logger(), "Engine has %d I/O tensors:", nbIOTensors);
-
         for (int32_t i = 0; i < nbIOTensors; ++i)
         {
             const char *tensorName = engine_->getIOTensorName(i);
-            TensorIOMode ioMode = engine_->getTensorIOMode(tensorName);
-            auto dims = engine_->getTensorShape(tensorName);
-
-            std::string shape_str = "[";
-            for (int j = 0; j < dims.nbDims; ++j)
-            {
-                if (j > 0)
-                    shape_str += ", ";
-                shape_str += std::to_string(dims.d[j]);
-            }
-            shape_str += "]";
-
-            RCLCPP_INFO(this->get_logger(), "  %s: %s, shape: %s",
-                        tensorName,
-                        (ioMode == TensorIOMode::kINPUT) ? "INPUT" : "OUTPUT",
-                        shape_str.c_str());
-
-            if (ioMode == TensorIOMode::kINPUT)
+            if (engine_->getTensorIOMode(tensorName) == TensorIOMode::kINPUT)
             {
                 input_tensor_name_ = tensorName;
             }
@@ -274,43 +313,42 @@ private:
             {
                 std::string name = tensorName;
                 if (name == "keypoints")
-                    output_keypoints_name_ = tensorName;
+                    output_keypoints_name_ = name;
                 else if (name == "matches")
-                    output_matches_name_ = tensorName;
+                    output_matches_name_ = name;
                 else if (name == "mscores")
-                    output_scores_name_ = tensorName;
+                    output_scores_name_ = name;
             }
         }
-
-        RCLCPP_INFO(this->get_logger(), "Assigned tensor names:");
-        RCLCPP_INFO(this->get_logger(), "  Input: %s", input_tensor_name_.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Keypoints: %s", output_keypoints_name_.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Matches: %s", output_matches_name_.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Scores: %s", output_scores_name_.c_str());
+        RCLCPP_INFO(this->get_logger(), "Input: %s, Keypoints: %s, Matches: %s, Scores: %s",
+                    input_tensor_name_.c_str(), output_keypoints_name_.c_str(),
+                    output_matches_name_.c_str(), output_scores_name_.c_str());
     }
 
     void allocateBuffers()
     {
-        size_t input_size = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(float);
-        cudaMalloc(&d_input_, input_size);
+        // Allocate final input buffer as FP16
+        size_t input_size_fp16 = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(uint16_t);
+        cudaMalloc(&d_input_, input_size_fp16);
 
-        // Allocate for FP16 output from TensorRT
+        // Allocate a temporary buffer for preprocessing with FP32 for the GPU path
+        if (use_gpu_preprocessing_)
+        {
+            size_t input_size_fp32 = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(float);
+            cudaMalloc(&d_temp_input_fp32_, input_size_fp32);
+        }
+
         size_t keypoints_size_fp16 = BATCH_SIZE * max_keypoints_ * 2 * sizeof(uint16_t);
         cudaMalloc(&d_output_keypoints_fp16_, keypoints_size_fp16);
 
-        // Allocate for FP32 converted keypoints
         size_t keypoints_size_fp32 = BATCH_SIZE * max_keypoints_ * 2 * sizeof(float);
         cudaMalloc(&d_output_keypoints_fp32_, keypoints_size_fp32);
 
-        // Host buffers
         h_keypoints_.resize(BATCH_SIZE * max_keypoints_ * 2);
         h_matches_.resize(max_keypoints_ * 3);
         h_scores_.resize(max_keypoints_);
 
-        processing_ = false;
         last_process_time_ = std::chrono::steady_clock::now();
-        frame_counter_ = 0;
-
         RCLCPP_INFO(this->get_logger(), "Frame skipping: %s (N=%d, rate=%.1fHz)",
                     frame_skip_mode_.c_str(), frame_skip_n_, max_process_rate_hz_);
     }
@@ -318,14 +356,12 @@ private:
     void setupBindingsAndAllocators()
     {
         context_->setTensorAddress(input_tensor_name_.c_str(), d_input_);
-        // Point the engine output to the FP16 buffer
         context_->setTensorAddress(output_keypoints_name_.c_str(), d_output_keypoints_fp16_);
 
         for (const auto &name : {output_matches_name_, output_scores_name_})
         {
             if (!name.empty())
             {
-                RCLCPP_INFO(this->get_logger(), "Setting up dynamic allocator for: %s", name.c_str());
                 auto allocator = std::make_unique<DynamicOutputAllocator>();
                 context_->setOutputAllocator(name.c_str(), allocator.get());
                 mAllocatorMap.emplace(name, std::move(allocator));
@@ -335,82 +371,204 @@ private:
 
     void initGPUPreprocessing()
     {
-        cv_stream_ = cv::cuda::Stream();
-        gpu_left_.create(input_height_, input_width_, CV_8UC1);
-        gpu_right_.create(input_height_, input_width_, CV_8UC1);
-        gpu_left_resized_.create(input_height_, input_width_, CV_8UC1);
-        gpu_right_resized_.create(input_height_, input_width_, CV_8UC1);
-        gpu_left_gray_.create(input_height_, input_width_, CV_8UC1);
-        gpu_right_gray_.create(input_height_, input_width_, CV_8UC1);
-        gpu_left_norm_.create(input_height_, input_width_, CV_32FC1);
-        gpu_right_norm_.create(input_height_, input_width_, CV_32FC1);
-        gpu_batch_.create(input_height_ * BATCH_SIZE, input_width_, CV_32FC1);
+        cv_stream_ = cv::cuda::StreamAccessor::wrapStream(stream_);
     }
 
-    void preprocessGPU(const cv::Mat &left_img, const cv::Mat &right_img)
+    void preprocessGPU(const cv::Mat &left_img, const cv::Mat &right_img, bool is_grayscale)
     {
-        gpu_left_.upload(left_img, cv_stream_);
-        gpu_right_.upload(right_img, cv_stream_);
+        cv::cuda::GpuMat gpu_imgs[2];
+        cv::cuda::GpuMat gpu_resized_imgs[2];
+        cv::cuda::GpuMat gpu_gray_imgs[2];
+        cv::cuda::GpuMat gpu_norm_imgs[2];
 
-        cv::cuda::resize(gpu_left_, gpu_left_resized_, cv::Size(input_width_, input_height_), 0, 0, cv::INTER_LINEAR, cv_stream_);
-        cv::cuda::resize(gpu_right_, gpu_right_resized_, cv::Size(input_width_, input_height_), 0, 0, cv::INTER_LINEAR, cv_stream_);
-
-        if (left_img.channels() == 3)
-        {
-            cv::cuda::cvtColor(gpu_left_resized_, gpu_left_gray_, cv::COLOR_BGR2GRAY, 0, cv_stream_);
-            cv::cuda::cvtColor(gpu_right_resized_, gpu_right_gray_, cv::COLOR_BGR2GRAY, 0, cv_stream_);
-        }
-        else
-        {
-            gpu_left_gray_ = gpu_left_resized_;
-            gpu_right_gray_ = gpu_right_resized_;
-        }
-
-        gpu_left_gray_.convertTo(gpu_left_norm_, CV_32FC1, 1.0 / 255.0, 0, cv_stream_);
-        gpu_right_gray_.convertTo(gpu_right_norm_, CV_32FC1, 1.0 / 255.0, 0, cv_stream_);
-
-        gpu_left_norm_.copyTo(gpu_batch_(cv::Rect(0, 0, input_width_, input_height_)), cv_stream_);
-        gpu_right_norm_.copyTo(gpu_batch_(cv::Rect(0, input_height_, input_width_, input_height_)), cv_stream_);
-
-        cv::Mat batch_host;
-        gpu_batch_.download(batch_host, cv_stream_);
+        // Upload to GPU
+        gpu_imgs[0].upload(left_img, cv_stream_);
+        gpu_imgs[1].upload(right_img, cv_stream_);
         cv_stream_.waitForCompletion();
-
-        cudaMemcpyAsync(d_input_, batch_host.data, batch_host.total() * batch_host.elemSize(), cudaMemcpyHostToDevice, stream_);
-    }
-
-void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *output)
-    {
-        cv::Mat imgs[2] = {left_img, right_img};
 
         for (int i = 0; i < 2; ++i)
         {
-            cv::Mat processed;
-
-            // Convert to grayscale if needed
-            if (imgs[i].channels() == 3)
+            if (gpu_imgs[i].empty())
             {
-                cv::cvtColor(imgs[i], processed, cv::COLOR_BGR2GRAY);
+                std::cerr << "[WARN] GPU image " << i << " is EMPTY after upload!" << std::endl;
             }
             else
             {
-                processed = imgs[i];
+                std::cerr << "[INFO] GPU image " << i << ": "
+                          << gpu_imgs[i].cols << "x" << gpu_imgs[i].rows
+                          << " ch=" << gpu_imgs[i].channels()
+                          << " step=" << gpu_imgs[i].step << std::endl;
             }
-
-            // Resize if needed
-            if (processed.rows != input_height_ || processed.cols != input_width_)
-            {
-                cv::resize(processed, processed, cv::Size(input_width_, input_height_));
-            }
-
-            // Normalize
-            processed.convertTo(processed, CV_32F, 1.0 / 255.0);
-
-            // Copy to output buffer (NCHW format)
-            int offset = i * CHANNELS * input_height_ * input_width_;
-            memcpy(output + offset, processed.data, CHANNELS * input_height_ * input_width_ * sizeof(float));
         }
-}
+
+        // Resize
+        for (int i = 0; i < 2; ++i)
+        {
+            cv::cuda::resize(gpu_imgs[i], gpu_resized_imgs[i],
+                             cv::Size(input_width_, input_height_),
+                             0, 0, cv::INTER_LINEAR, cv_stream_);
+        }
+        cv_stream_.waitForCompletion();
+
+        // Convert to grayscale if needed
+        if (is_grayscale)
+        {
+            for (int i = 0; i < 2; ++i)
+            {
+                if (gpu_resized_imgs[i].channels() == 1)
+                {
+                    gpu_resized_imgs[i].copyTo(gpu_gray_imgs[i], cv_stream_); // deep copy
+                }
+                else
+                {
+                    cv::cuda::cvtColor(gpu_resized_imgs[i], gpu_gray_imgs[i],
+                                       cv::COLOR_BGR2GRAY, 1, cv_stream_);
+                }
+            }
+        }
+        else
+        {
+            for (int i = 0; i < 2; ++i)
+            {
+                gpu_resized_imgs[i].copyTo(gpu_gray_imgs[i], cv_stream_);
+            }
+        }
+        cv_stream_.waitForCompletion();
+
+        // Normalize to [0,1] float
+        for (int i = 0; i < 2; ++i)
+        {
+            gpu_gray_imgs[i].convertTo(gpu_norm_imgs[i], CV_32F, 1.0 / 255.0, 0.0, cv_stream_);
+        }
+        cv_stream_.waitForCompletion();
+
+        // Debug — dump normalized images
+        for (int i = 0; i < 2; ++i)
+        {
+            cv::Mat dbg;
+            gpu_norm_imgs[i].download(dbg, cv_stream_);
+            cv_stream_.waitForCompletion();
+            cv::imwrite("/home/nvidia/ros2_ws/tmp/debug_norm_" + std::to_string(i) + ".png", dbg * 255);
+            std::cerr << "[DEBUG] Saved /home/nvidia/ros2_ws/tmp/debug_norm_" << i << ".png" << std::endl;
+        }
+    }
+
+    void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, uint16_t *output, bool is_grayscale)
+    {
+        cv::Mat imgs[2] = {left_img, right_img};
+        const int image_area = input_height_ * input_width_;
+
+        for (int i = 0; i < 2; ++i)
+        {
+            cv::Mat resized_img;
+            if (imgs[i].rows != input_height_ || imgs[i].cols != input_width_)
+            {
+                cv::resize(imgs[i], resized_img, cv::Size(input_width_, input_height_));
+            }
+            else
+            {
+                resized_img = imgs[i];
+            }
+
+            cv::Mat gray_img;
+            if (!is_grayscale)
+            {
+                cv::cvtColor(resized_img, gray_img, cv::COLOR_BGR2GRAY);
+            }
+            else
+            {
+                gray_img = resized_img;
+            }
+
+            cv::Mat float_img;
+            gray_img.convertTo(float_img, CV_32FC1, 1.0 / 255.0);
+
+            if (!float_img.isContinuous())
+            {
+                float_img = float_img.clone();
+            }
+
+            float *float_ptr = reinterpret_cast<float *>(float_img.data);
+            uint16_t *buffer_offset = output + i * image_area;
+            for (int p = 0; p < image_area; ++p)
+            {
+                buffer_offset[p] = float_to_half_bits(float_ptr[p]);
+            }
+        }
+    }
+
+    void debugInputTensorFP32(const float *d_fp32, int sample_size, cudaStream_t stream)
+    {
+        std::vector<float> host_fp32(sample_size);
+        cudaMemcpyAsync(host_fp32.data(), d_fp32,
+                        sample_size * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+
+        RCLCPP_INFO(this->get_logger(), "[DEBUG FP32] First 10 values:");
+        for (int i = 0; i < 10; ++i)
+            RCLCPP_INFO(this->get_logger(), "  Pixel[%d]: %.6f", i, host_fp32[i]);
+
+        auto [min_it, max_it] = std::minmax_element(host_fp32.begin(), host_fp32.end());
+        RCLCPP_INFO(this->get_logger(), "[DEBUG FP32] Range: [%.6f, %.6f]", *min_it, *max_it);
+    }
+
+    void debugInputTensorFP16(const __half *d_fp16, int sample_size, cudaStream_t stream)
+    {
+        std::vector<float> host_fp32(sample_size);
+
+        // Temporary GPU buffer for FP32
+        float *d_temp_fp32 = nullptr;
+        cudaMalloc(&d_temp_fp32, sample_size * sizeof(float));
+
+        // Convert FP16 → FP32 for inspection
+        launchConvertFP16ToFP32(d_fp16, d_temp_fp32, sample_size, stream);
+
+        cudaMemcpyAsync(host_fp32.data(), d_temp_fp32,
+                        sample_size * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        cudaFree(d_temp_fp32);
+
+        RCLCPP_INFO(this->get_logger(), "[DEBUG FP16] First 10 values:");
+        for (int i = 0; i < 10; ++i)
+            RCLCPP_INFO(this->get_logger(), "  Pixel[%d]: %.6f", i, host_fp32[i]);
+
+        auto [min_it, max_it] = std::minmax_element(host_fp32.begin(), host_fp32.end());
+        RCLCPP_INFO(this->get_logger(), "[DEBUG FP16] Range: [%.6f, %.6f]", *min_it, *max_it);
+    }
+
+    void debugRawInput(const cv::Mat &left_img, const cv::Mat &right_img)
+    {
+        RCLCPP_INFO(this->get_logger(), "Raw image info:");
+        RCLCPP_INFO(this->get_logger(), " Left: %dx%d, channels=%d, type=%d",
+                    left_img.cols, left_img.rows, left_img.channels(), left_img.type());
+        RCLCPP_INFO(this->get_logger(), " Right: %dx%d, channels=%d, type=%d",
+                    right_img.cols, right_img.rows, right_img.channels(), right_img.type());
+        // Check if images have data
+
+        if (left_img.empty() || right_img.empty())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Input images are empty!");
+            return;
+        }
+
+        // Sample pixel values from raw images
+        RCLCPP_INFO(this->get_logger(), "Raw pixel samples:");
+        for (int i = 0; i < 5; ++i)
+        {
+            if (left_img.channels() == 3)
+            {
+                cv::Vec3b pixel = left_img.at<cv::Vec3b>(100, 100 + i);
+                RCLCPP_INFO(this->get_logger(), " Left[%d]: (%d,%d,%d)", i, pixel[0], pixel[1], pixel[2]);
+            }
+            else
+            {
+                uint8_t pixel = left_img.at<uint8_t>(100, 100 + i);
+                RCLCPP_INFO(this->get_logger(), " Left[%d]: %d", i, pixel);
+            }
+        }
+    }
 
     void stereoCallback(
         const sensor_msgs::msg::Image::ConstSharedPtr &left_msg,
@@ -418,24 +576,57 @@ void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *out
     {
         if (!shouldProcessFrame())
             return;
-
         processing_.store(true);
         auto start = std::chrono::high_resolution_clock::now();
 
         try
         {
-            cv_bridge::CvImagePtr left_cv = cv_bridge::toCvCopy(left_msg, "bgr8");
-            cv_bridge::CvImagePtr right_cv = cv_bridge::toCvCopy(right_msg, "bgr8");
+            bool is_grayscale = (left_msg->encoding == "mono8");
+            const char *desired_encoding = is_grayscale ? "mono8" : "bgr8";
+
+            cv_bridge::CvImagePtr left_cv = cv_bridge::toCvCopy(left_msg, desired_encoding);
+            cv_bridge::CvImagePtr right_cv = cv_bridge::toCvCopy(right_msg, desired_encoding);
+            debugRawInput(left_cv->image, right_cv->image);
+
+            if (left_cv->image.empty() || right_cv->image.empty())
+            {
+                RCLCPP_WARN(get_logger(), "Received empty image(s), skipping frame.");
+                processing_.store(false);
+                return;
+            }
 
             if (use_gpu_preprocessing_)
             {
-                preprocessGPU(left_cv->image, right_cv->image);
+                preprocessGPU(left_cv->image, right_cv->image, is_grayscale);
+                // const int elements = BATCH_SIZE * CHANNELS * input_height_ * input_width_;
+                // debugInputTensorFP16(
+                //     reinterpret_cast<const __half *>(d_input_),
+                //     elements,
+                //     stream_);
+                // debugInputTensorFP32(
+                //     reinterpret_cast<const float *>(d_temp_input_fp32_),
+                //     elements,
+                //     stream_);
             }
             else
             {
-                std::vector<float> h_input(BATCH_SIZE * CHANNELS * input_height_ * input_width_);
-                preprocessCPU(left_cv->image, right_cv->image, h_input.data());
-                cudaMemcpyAsync(d_input_, h_input.data(), h_input.size() * sizeof(float), cudaMemcpyHostToDevice, stream_);
+                std::vector<uint16_t> h_input(BATCH_SIZE * CHANNELS * input_height_ * input_width_);
+                preprocessCPU(left_cv->image, right_cv->image, h_input.data(), is_grayscale);
+                cudaMemcpyAsync(d_input_, h_input.data(), h_input.size() * sizeof(uint16_t), cudaMemcpyHostToDevice, stream_);
+            }
+
+            nvinfer1::Dims input_dims;
+            input_dims.nbDims = 4;
+            input_dims.d[0] = BATCH_SIZE;
+            input_dims.d[1] = CHANNELS;
+            input_dims.d[2] = input_height_;
+            input_dims.d[3] = input_width_;
+
+            if (!context_->setInputShape(input_tensor_name_.c_str(), input_dims))
+            {
+                RCLCPP_ERROR(this->get_logger(), "Failed to set input shape");
+                processing_.store(false);
+                return;
             }
 
             if (!context_->enqueueV3(stream_))
@@ -449,9 +640,9 @@ void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *out
             launchConvertFP16ToFP32(
                 reinterpret_cast<const __half *>(d_output_keypoints_fp16_),
                 reinterpret_cast<float *>(d_output_keypoints_fp32_),
-                total_keypoint_elements, stream_);
+                total_keypoint_elements,
+                stream_);
 
-            // Add error checking
             cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess)
             {
@@ -474,16 +665,18 @@ void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *out
 
             if (actual_num_matches_ > 0)
             {
-                if (actual_num_matches_ > static_cast<int>(h_matches_.size() / 3))
+                size_t max_host_matches = h_matches_.size() / 3;
+                if (actual_num_matches_ > static_cast<int>(max_host_matches))
                 {
-                    RCLCPP_WARN(this->get_logger(), "Model produced more matches (%d) than host buffer capacity (%zu). Truncating.", actual_num_matches_, h_matches_.size() / 3);
-                    actual_num_matches_ = h_matches_.size() / 3;
+                    RCLCPP_WARN(this->get_logger(), "Model produced more matches (%d) than host buffer capacity (%zu). Truncating.", actual_num_matches_, max_host_matches);
+                    actual_num_matches_ = max_host_matches;
                 }
                 cudaMemcpyAsync(h_matches_.data(), d_matches_ptr, actual_num_matches_ * 3 * sizeof(int), cudaMemcpyDeviceToHost, stream_);
                 cudaMemcpyAsync(h_scores_.data(), d_scores_ptr, actual_num_matches_ * sizeof(float), cudaMemcpyDeviceToHost, stream_);
             }
 
             cudaStreamSynchronize(stream_);
+
             auto end = std::chrono::high_resolution_clock::now();
             if (profile_inference_)
             {
@@ -491,6 +684,10 @@ void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *out
             }
 
             processAndPublishResults(left_cv->image, right_cv->image, left_msg->header);
+        }
+        catch (const cv_bridge::Exception &e)
+        {
+            RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
         }
         catch (const std::exception &e)
         {
@@ -512,7 +709,7 @@ void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *out
             frame_counter_++;
             return (frame_counter_ % frame_skip_n_ == 0);
         }
-        else if (frame_skip_mode_ == "rate_limit")
+        if (frame_skip_mode_ == "rate_limit")
         {
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_process_time_).count() >= (1000.0 / max_process_rate_hz_))
@@ -525,58 +722,14 @@ void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *out
         return true;
     }
 
-    void processAndPublishResults(const cv::Mat &left_img, const cv::Mat &right_img,
-                                  const std_msgs::msg::Header &header)
-    {
-        if (matches_pub_->get_subscription_count() == 0)
-            return;
-
-        // Calculate scaling factors to draw on original image size
-        const float scale_x = static_cast<float>(left_img.cols) / input_width_;
-        const float scale_y = static_cast<float>(left_img.rows) / input_height_;
-
-        cv::Mat viz_img;
-        cv::hconcat(left_img, right_img, viz_img);
-        if (viz_img.channels() == 1)
-            cv::cvtColor(viz_img, viz_img, cv::COLOR_GRAY2BGR);
-
-        std::vector<cv::Point2f> kpts_left_raw, kpts_right_raw;
-        parseKeypoints(kpts_left_raw, kpts_right_raw);
-
-        std::vector<cv::DMatch> matches;
-        parseMatches(matches, kpts_left_raw, kpts_right_raw);
-
-        // Draw all valid keypoints
-        drawKeypoints(viz_img, kpts_left_raw, kpts_right_raw, scale_x, scale_y, left_img.cols);
-
-        // Draw matches on top
-        drawMatches(viz_img, kpts_left_raw, kpts_right_raw, matches, scale_x, scale_y, left_img.cols);
-
-        int valid_left_kpts = std::count_if(kpts_left_raw.begin(), kpts_left_raw.end(), [](const cv::Point2f &pt)
-                                            { return pt.x >= 0; });
-        int valid_right_kpts = std::count_if(kpts_right_raw.begin(), kpts_right_raw.end(), [](const cv::Point2f &pt)
-                                             { return pt.x >= 0; });
-
-        drawInfoOverlay(viz_img, valid_left_kpts, valid_right_kpts, matches.size());
-
-        auto viz_msg = cv_bridge::CvImage(header, "bgr8", viz_img).toImageMsg();
-        matches_pub_->publish(*viz_msg);
-    }
-
     void parseKeypoints(std::vector<cv::Point2f> &left_kpts, std::vector<cv::Point2f> &right_kpts)
     {
-        // Create full-sized vectors. Invalid keypoints will have negative coords from the model.
         left_kpts.resize(max_keypoints_);
         right_kpts.resize(max_keypoints_);
-
         const int kpts_per_image = max_keypoints_ * 2;
-
         for (int i = 0; i < max_keypoints_; ++i)
         {
             left_kpts[i] = cv::Point2f(h_keypoints_[i * 2], h_keypoints_[i * 2 + 1]);
-        }
-        for (int i = 0; i < max_keypoints_; ++i)
-        {
             right_kpts[i] = cv::Point2f(h_keypoints_[kpts_per_image + i * 2], h_keypoints_[kpts_per_image + i * 2 + 1]);
         }
     }
@@ -594,86 +747,122 @@ void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *out
             int right_idx = h_matches_[i * 3 + 1];
             float confidence = h_scores_[i];
 
-            // Check if indices are valid and if the keypoints they refer to are also valid (not filtered out)
             if (left_idx >= 0 && left_idx < static_cast<int>(left_kpts.size()) &&
                 right_idx >= 0 && right_idx < static_cast<int>(right_kpts.size()) &&
                 left_kpts[left_idx].x >= 0 && right_kpts[right_idx].x >= 0 &&
-                confidence > 0.1f) // Confidence threshold
+                confidence > 0.1f)
             {
                 matches.emplace_back(left_idx, right_idx, 1.0f - confidence);
             }
         }
-        std::sort(matches.begin(), matches.end(), [](const cv::DMatch &a, const cv::DMatch &b)
-                  { return a.distance < b.distance; });
-        RCLCPP_DEBUG(this->get_logger(), "Parsed %zu matches from %d candidates", matches.size(), num_candidates);
     }
 
-    void drawKeypoints(cv::Mat &viz_img,
-                       const std::vector<cv::Point2f> &left_kpts,
-                       const std::vector<cv::Point2f> &right_kpts,
-                       float scale_x, float scale_y, int left_img_width)
+    cv::Scalar getMatchColor(float confidence)
     {
-        for (const auto &pt_raw : left_kpts)
+        float hue = std::min(1.0f - confidence, 1.0f) * 60.0f; // Red (bad) to Green (good)
+        cv::Mat hsv(1, 1, CV_8UC3, cv::Scalar(hue, 255, 255));
+        cv::Mat bgr;
+        cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
+        return cv::Scalar(bgr.at<cv::Vec3b>(0, 0));
+    }
+
+    void processAndPublishResults(const cv::Mat &left_img, const cv::Mat &right_img,
+                                  const std_msgs::msg::Header &header)
+    {
+        if (matches_pub_->get_subscription_count() == 0)
+            return;
+
+        cv::Mat viz_img;
+        cv::hconcat(left_img, right_img, viz_img);
+        if (viz_img.channels() == 1)
+            cv::cvtColor(viz_img, viz_img, cv::COLOR_GRAY2BGR);
+
+        const float scale_x = static_cast<float>(left_img.cols) / input_width_;
+        const float scale_y = static_cast<float>(left_img.rows) / input_height_;
+
+        std::vector<cv::Point2f> kpts_left_raw, kpts_right_raw;
+        parseKeypoints(kpts_left_raw, kpts_right_raw);
+
+        std::vector<cv::DMatch> all_matches;
+        parseMatches(all_matches, kpts_left_raw, kpts_right_raw);
+
+        std::vector<bool> left_matched(kpts_left_raw.size(), false);
+        std::vector<bool> right_matched(kpts_right_raw.size(), false);
+        std::vector<float> match_confidences(kpts_left_raw.size(), 0.f);
+
+        for (const auto &match : all_matches)
         {
-            if (pt_raw.x < 0)
-                continue; // Skip invalid keypoints
-            cv::Point2f pt(pt_raw.x * scale_x, pt_raw.y * scale_y);
-            cv::circle(viz_img, pt, 2, cv::Scalar(0, 255, 0), -1);
+            left_matched[match.queryIdx] = true;
+            right_matched[match.trainIdx] = true;
+            match_confidences[match.queryIdx] = 1.0f - match.distance;
         }
 
-        for (const auto &pt_raw : right_kpts)
+        for (const auto &match : all_matches)
         {
-            if (pt_raw.x < 0)
+            cv::Point2f pt1_raw = kpts_left_raw[match.queryIdx];
+            cv::Point2f pt2_raw = kpts_right_raw[match.trainIdx];
+            cv::Point pt1(cvRound(pt1_raw.x * scale_x), cvRound(pt1_raw.y * scale_y));
+            cv::Point pt2(cvRound(pt2_raw.x * scale_x) + left_img.cols, cvRound(pt2_raw.y * scale_y));
+            cv::Scalar color = getMatchColor(1.0f - match.distance);
+            cv::line(viz_img, pt1, pt2, color, 1, cv::LINE_AA);
+        }
+
+        for (size_t i = 0; i < kpts_left_raw.size(); ++i)
+        {
+            if (kpts_left_raw[i].x < 0)
                 continue;
-            cv::Point2f pt(pt_raw.x * scale_x + left_img_width, pt_raw.y * scale_y);
-            cv::circle(viz_img, pt, 2, cv::Scalar(255, 0, 0), -1);
+            cv::Point pt(cvRound(kpts_left_raw[i].x * scale_x), cvRound(kpts_left_raw[i].y * scale_y));
+            cv::Scalar color = left_matched[i] ? getMatchColor(match_confidences[i]) : cv::Scalar(0, 0, 255); // Red if unmatched
+            cv::circle(viz_img, pt, 2, color, -1, cv::LINE_AA);
         }
-    }
 
-    void drawMatches(cv::Mat &viz_img,
-                     const std::vector<cv::Point2f> &left_kpts,
-                     const std::vector<cv::Point2f> &right_kpts,
-                     const std::vector<cv::DMatch> &matches,
-                     float scale_x, float scale_y, int left_img_width)
-    {
-        for (const auto &match : matches)
+        for (size_t i = 0; i < kpts_right_raw.size(); ++i)
         {
-            cv::Point2f pt1_raw = left_kpts[match.queryIdx];
-            cv::Point2f pt2_raw = right_kpts[match.trainIdx];
-
-            cv::Point2f pt1(pt1_raw.x * scale_x, pt1_raw.y * scale_y);
-            cv::Point2f pt2(pt2_raw.x * scale_x + left_img_width, pt2_raw.y * scale_y);
-
-            cv::Scalar color;
-            if (match.distance < 0.3f)
-                color = cv::Scalar(0, 255, 255); // Yellow - high confidence
-            else if (match.distance < 0.6f)
-                color = cv::Scalar(0, 165, 255); // Orange - medium confidence
-            else
-                color = cv::Scalar(0, 0, 255); // Red - low confidence
-
-            cv::line(viz_img, pt1, pt2, color, 1);
-            cv::circle(viz_img, pt1, 3, color, 1);
-            cv::circle(viz_img, pt2, 3, color, 1);
+            if (kpts_right_raw[i].x < 0)
+                continue;
+            cv::Point pt(cvRound(kpts_right_raw[i].x * scale_x) + left_img.cols, cvRound(kpts_right_raw[i].y * scale_y));
+            // To color right points, we need to find the match it's part of
+            cv::Scalar color = cv::Scalar(0, 0, 255); // Red if unmatched
+            if (right_matched[i])
+            {
+                // This is slightly inefficient but fine for visualization
+                for (const auto &m : all_matches)
+                {
+                    if (m.trainIdx == static_cast<int>(i))
+                    {
+                        color = getMatchColor(1.0f - m.distance);
+                        break;
+                    }
+                }
+            }
+            cv::circle(viz_img, pt, 2, color, -1, cv::LINE_AA);
         }
+
+        int valid_left_kpts = std::count_if(kpts_left_raw.begin(), kpts_left_raw.end(), [](const cv::Point2f &pt)
+                                            { return pt.x >= 0; });
+        int valid_right_kpts = std::count_if(kpts_right_raw.begin(), kpts_right_raw.end(), [](const cv::Point2f &pt)
+                                             { return pt.x >= 0; });
+        drawInfoOverlay(viz_img, valid_left_kpts, valid_right_kpts, all_matches.size());
+
+        auto viz_msg = cv_bridge::CvImage(header, "bgr8", viz_img).toImageMsg();
+        matches_pub_->publish(*viz_msg);
     }
 
     void drawInfoOverlay(cv::Mat &viz_img, int left_count, int right_count, int match_count)
     {
         cv::rectangle(viz_img, cv::Point(5, 5), cv::Point(200, 75), cv::Scalar(0, 0, 0), -1);
         cv::addWeighted(viz_img(cv::Rect(5, 5, 195, 70)), 0.5, viz_img(cv::Rect(5, 5, 195, 70)), 0.5, 0, viz_img(cv::Rect(5, 5, 195, 70)));
-
         cv::putText(viz_img, "Left kpts: " + std::to_string(left_count), cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
         cv::putText(viz_img, "Right kpts: " + std::to_string(right_count), cv::Point(10, 45), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 1);
         cv::putText(viz_img, "Matches: " + std::to_string(match_count), cv::Point(10, 65), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
-
-        cv::line(viz_img, cv::Point(viz_img.cols / 2, 0), cv::Point(viz_img.cols / 2, viz_img.rows), cv::Scalar(255, 255, 255), 1);
     }
 
     void cleanup()
     {
         if (d_input_)
             cudaFree(d_input_);
+        if (d_temp_input_fp32_)
+            cudaFree(d_temp_input_fp32_);
         if (d_output_keypoints_fp16_)
             cudaFree(d_output_keypoints_fp16_);
         if (d_output_keypoints_fp32_)

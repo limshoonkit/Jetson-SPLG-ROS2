@@ -23,7 +23,7 @@ def generate_launch_description():
                 'profile_inference': False,
                 'use_gpu_preprocessing': True,
                 'frame_skip_mode': 'every_nth',  # Options: 'every_nth', 'rate_limit', 'none'
-                'frame_skip_n': 2,  # For every_nth mode
+                'frame_skip_n': 3,  # For every_nth mode
                 'max_process_rate_hz': 20.0,  # For rate_limit mode
             }
         ],
