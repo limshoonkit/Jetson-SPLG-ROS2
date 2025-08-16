@@ -170,7 +170,8 @@ private:
     std::unique_ptr<IExecutionContext> context_;
 
     // GPU memory buffers
-    void *d_input_; // Input tensor (FP32)
+    void *d_input_; // Input tensor
+    void *d_output_keypoints_; // Output keypoints tensor
     std::unordered_map<std::string, std::unique_ptr<DynamicOutputAllocator>> mAllocatorMap;
 
     // Host memory buffers for results
@@ -210,7 +211,7 @@ private:
     static constexpr int CHANNELS = 1;
 
     cudaStream_t stream_;
-    cv::cuda::Stream cv_stream_;
+    // cv::cuda::Stream cv_stream_;
 
     // Performance monitoring
     std::chrono::high_resolution_clock::time_point preprocess_start_, inference_start_;
@@ -286,22 +287,25 @@ private:
 
     void allocateBuffers()
     {
-        // Allocate input buffer for normalized images (FP32)
-        size_t input_size = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(float);
+        // Allocate buffer for input and output tensors
+        size_t input_size = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(float); // NCHW (2, 1, H, W)
+        size_t output_keypoints_size = BATCH_SIZE * max_keypoints_ * 2 * sizeof(float); // (2, max_keypoints, 2)
 
         if (use_unified_memory_)
         {
             CUDA_CHECK(cudaMallocManaged(&d_input_, input_size));
+            CUDA_CHECK(cudaMallocManaged(&d_output_keypoints_, output_keypoints_size));
         }
         else
         {
             CUDA_CHECK(cudaMalloc(&d_input_, input_size));
+            CUDA_CHECK(cudaMalloc(&d_output_keypoints_, output_keypoints_size));
         }
 
         // Host buffers for results - pre-allocate maximum sizes
         h_keypoints_.resize(BATCH_SIZE * max_keypoints_ * 2);
-        h_matches_.resize(max_keypoints_ * 3);
-        h_scores_.resize(max_keypoints_);
+        h_matches_.resize(max_keypoints_ * 3); // (-1, 3)
+        h_scores_.resize(max_keypoints_); // (-1)
 
         last_process_time_ = std::chrono::steady_clock::now();
         RCLCPP_INFO(this->get_logger(), "Frame skipping: %s (N=%d, rate=%.1fHz)",
@@ -310,9 +314,37 @@ private:
 
     void setupBindingsAndAllocators()
     {
-        context_->setTensorAddress(input_tensor_name_.c_str(), d_input_);
+        if (profile_inference_)
+        {
+            auto input_shape = engine_->getTensorShape(input_tensor_name_.c_str());
+            if (input_shape.nbDims == 4)
+                RCLCPP_WARN(this->get_logger(), "Input shape: %ld, %ld, %ld, %ld", input_shape.d[0],
+                            input_shape.d[1], input_shape.d[2], input_shape.d[3]);
 
-        // Use dynamic allocators for all outputs including keypoints
+            auto output_keypoints_shape = engine_->getTensorShape(output_keypoints_name_.c_str());
+            if (output_keypoints_shape.nbDims == 3)
+                RCLCPP_WARN(this->get_logger(), "Output keypoints shape: %ld, %ld, %ld", output_keypoints_shape.d[0],
+                            output_keypoints_shape.d[1], output_keypoints_shape.d[2]);
+
+            auto output_matches_shape = engine_->getTensorShape(output_matches_name_.c_str());
+            if (output_matches_shape.nbDims == 2)
+                RCLCPP_WARN(this->get_logger(), "Output matches shape: %ld, %ld", output_matches_shape.d[0],
+                            output_matches_shape.d[1]);
+
+            auto output_scores_shape = engine_->getTensorShape(output_scores_name_.c_str());
+            if (output_scores_shape.nbDims == 1)
+                RCLCPP_WARN(this->get_logger(), "Output scores shape: %ld", output_scores_shape.d[0]);
+        }
+
+        // Set fixed input tensor address and shape
+        context_->setInputTensorAddress(input_tensor_name_.c_str(), d_input_);
+        context_->setInputShape(input_tensor_name_.c_str(),
+                                nvinfer1::Dims4{BATCH_SIZE, CHANNELS, input_height_, input_width_});
+
+        // Set output tensor address and shape
+        context_->setOutputTensorAddress(output_keypoints_name_.c_str(), d_output_keypoints_);
+
+        // Use dynamic allocators for all outputs
         for (const auto &name : {output_keypoints_name_, output_matches_name_, output_scores_name_})
         {
             if (!name.empty())
@@ -326,17 +358,7 @@ private:
 
     void initGPUPreprocessing()
     {
-        cv_stream_ = cv::cuda::StreamAccessor::wrapStream(stream_);
-
-        // Pre-allocate GPU matrices for better performance
-        gpu_left_uploaded_.create(input_height_, input_width_, CV_8UC3);
-        gpu_right_uploaded_.create(input_height_, input_width_, CV_8UC3);
-        gpu_left_resized_.create(input_height_, input_width_, CV_8UC3);
-        gpu_right_resized_.create(input_height_, input_width_, CV_8UC3);
-        gpu_left_gray_.create(input_height_, input_width_, CV_8UC1);
-        gpu_right_gray_.create(input_height_, input_width_, CV_8UC1);
-        gpu_left_norm_fp32_.create(input_height_, input_width_, CV_32F);
-        gpu_right_norm_fp32_.create(input_height_, input_width_, CV_32F);
+        // TODO: Implement GPU preprocessing
     }
 
     void preprocessGPU(const cv::Mat &left_img, const cv::Mat &right_img, bool is_grayscale)
@@ -346,50 +368,7 @@ private:
             preprocess_start_ = std::chrono::high_resolution_clock::now();
         }
 
-        gpu_left_uploaded_.upload(left_img, cv_stream_);
-        gpu_right_uploaded_.upload(right_img, cv_stream_);
-
-        // Resize if needed
-        if (gpu_left_uploaded_.cols != input_width_ || gpu_left_uploaded_.rows != input_height_)
-        {
-            cv::cuda::resize(gpu_left_uploaded_, gpu_left_resized_,
-                             cv::Size(input_width_, input_height_), 0, 0, cv::INTER_LINEAR, cv_stream_);
-        }
-        else
-        {
-            gpu_left_resized_ = gpu_left_uploaded_;
-        }
-
-        if (gpu_right_uploaded_.cols != input_width_ || gpu_right_uploaded_.rows != input_height_)
-        {
-            cv::cuda::resize(gpu_right_uploaded_, gpu_right_resized_,
-                             cv::Size(input_width_, input_height_), 0, 0, cv::INTER_LINEAR, cv_stream_);
-        }
-        else
-        {
-            gpu_right_resized_ = gpu_right_uploaded_;
-        }
-
-        // Convert to grayscale if needed
-        cv::cuda::GpuMat *left_gray_ptr = &gpu_left_resized_;
-        cv::cuda::GpuMat *right_gray_ptr = &gpu_right_resized_;
-
-        if (!is_grayscale)
-        {
-            cv::cuda::cvtColor(gpu_left_resized_, gpu_left_gray_, cv::COLOR_BGR2GRAY, 1, cv_stream_);
-            cv::cuda::cvtColor(gpu_right_resized_, gpu_right_gray_, cv::COLOR_BGR2GRAY, 1, cv_stream_);
-            left_gray_ptr = &gpu_left_gray_;
-            right_gray_ptr = &gpu_right_gray_;
-        }
-
-        // Normalize to [0,1] range
-        left_gray_ptr->convertTo(gpu_left_norm_fp32_, CV_32F, 1.0 / 255.0, cv_stream_);
-        right_gray_ptr->convertTo(gpu_right_norm_fp32_, CV_32F, 1.0 / 255.0, cv_stream_);
-
-        // Convert HWC to NCHW format for TensorRT
-        launchHWCToNCHWConversion(gpu_left_norm_fp32_, gpu_right_norm_fp32_,
-                                  static_cast<float *>(d_input_),
-                                  input_height_, input_width_, stream_);
+        // TODO: Implement GPU preprocessing
 
         if (profile_inference_)
         {
@@ -407,45 +386,7 @@ private:
             preprocess_start_ = std::chrono::high_resolution_clock::now();
         }
 
-        const int image_area = input_height_ * input_width_;
-        std::vector<cv::Mat> processed_images;
-
-        for (const auto &img : {left_img, right_img})
-        {
-            cv::Mat resized, gray, normalized;
-
-            // Resize if needed
-            if (img.cols != input_width_ || img.rows != input_height_)
-            {
-                cv::resize(img, resized, cv::Size(input_width_, input_height_));
-            }
-            else
-            {
-                resized = img;
-            }
-
-            // Convert to grayscale if needed
-            if (!is_grayscale)
-            {
-                cv::cvtColor(resized, gray, cv::COLOR_BGR2GRAY);
-            }
-            else
-            {
-                gray = resized;
-            }
-
-            // Normalize to [0,1] range
-            gray.convertTo(normalized, CV_32F, 1.0f / 255.0f);
-            processed_images.push_back(normalized);
-        }
-
-        // Convert to NCHW format (B=2, C=1, H, W)
-        for (size_t b = 0; b < 2; ++b)
-        {
-            const float *img_data = processed_images[b].ptr<float>();
-            float *output_ptr = output + b * image_area;
-            memcpy(output_ptr, img_data, image_area * sizeof(float));
-        }
+        // TODO: Implement CPU preprocessing
 
         if (profile_inference_)
         {
@@ -491,21 +432,6 @@ private:
                 CUDA_CHECK(cudaMemcpyAsync(d_input_, h_input.data(), h_input.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
             }
 
-            // Set input shape
-            nvinfer1::Dims input_dims;
-            input_dims.nbDims = 4;
-            input_dims.d[0] = BATCH_SIZE;
-            input_dims.d[1] = CHANNELS;
-            input_dims.d[2] = input_height_;
-            input_dims.d[3] = input_width_;
-
-            if (!context_->setInputShape(input_tensor_name_.c_str(), input_dims))
-            {
-                RCLCPP_ERROR(this->get_logger(), "Failed to set input shape");
-                processing_.store(false);
-                return;
-            }
-
             // Inference
             if (profile_inference_)
             {
@@ -527,41 +453,7 @@ private:
                 RCLCPP_INFO(this->get_logger(), "Inference: %.2f ms", inference_time);
             }
 
-            // Get dynamic output information
-            auto &keypoints_allocator = mAllocatorMap.at(output_keypoints_name_);
-            auto keypoints_dims = keypoints_allocator->getShape();
-            actual_num_keypoints_ = keypoints_dims.nbDims > 1 ? keypoints_dims.d[1] : max_keypoints_;
-            void *d_keypoints_ptr = keypoints_allocator->getBuffer();
-
-            auto &matches_allocator = mAllocatorMap.at(output_matches_name_);
-            auto matches_dims = matches_allocator->getShape();
-            actual_num_matches_ = matches_dims.nbDims > 0 ? matches_dims.d[0] : 0;
-            void *d_matches_ptr = matches_allocator->getBuffer();
-
-            auto &scores_allocator = mAllocatorMap.at(output_scores_name_);
-            void *d_scores_ptr = scores_allocator->getBuffer();
-
-            // Copy results to host
-            if (actual_num_keypoints_ > 0)
-            {
-                size_t keypoints_size = BATCH_SIZE * actual_num_keypoints_ * 2 * sizeof(float);
-                CUDA_CHECK(cudaMemcpyAsync(h_keypoints_.data(), d_keypoints_ptr, keypoints_size, cudaMemcpyDeviceToHost, stream_));
-            }
-
-            if (actual_num_matches_ > 0)
-            {
-                size_t max_host_matches = h_matches_.size() / 3;
-                if (actual_num_matches_ > static_cast<int>(max_host_matches))
-                {
-                    RCLCPP_WARN(this->get_logger(), "Model produced more matches (%d) than host buffer capacity (%zu). Truncating.",
-                                actual_num_matches_, max_host_matches);
-                    actual_num_matches_ = max_host_matches;
-                }
-                CUDA_CHECK(cudaMemcpyAsync(h_matches_.data(), d_matches_ptr, actual_num_matches_ * 3 * sizeof(int), cudaMemcpyDeviceToHost, stream_));
-                CUDA_CHECK(cudaMemcpyAsync(h_scores_.data(), d_scores_ptr, actual_num_matches_ * sizeof(float), cudaMemcpyDeviceToHost, stream_));
-            }
-
-            CUDA_CHECK(cudaStreamSynchronize(stream_));
+            // TODO: Process outputs
 
             auto pipeline_end = std::chrono::high_resolution_clock::now();
             if (profile_inference_)
@@ -726,29 +618,18 @@ private:
             cv::circle(viz_img, pt, 2, color, -1, cv::LINE_AA);
         }
 
-        int valid_left_kpts = std::count_if(kpts_left_raw.begin(), kpts_left_raw.end(), [](const cv::Point2f &pt)
-                                            { return pt.x >= 0; });
-        int valid_right_kpts = std::count_if(kpts_right_raw.begin(), kpts_right_raw.end(), [](const cv::Point2f &pt)
-                                             { return pt.x >= 0; });
-        drawInfoOverlay(viz_img, valid_left_kpts, valid_right_kpts, all_matches.size());
+        cv::putText(viz_img, "Matches: " + std::to_string(all_matches.size()), cv::Point(10, 65), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
 
         auto viz_msg = cv_bridge::CvImage(header, "bgr8", viz_img).toImageMsg();
         matches_pub_->publish(*viz_msg);
-    }
-
-    void drawInfoOverlay(cv::Mat &viz_img, int left_count, int right_count, int match_count)
-    {
-        cv::rectangle(viz_img, cv::Point(5, 5), cv::Point(200, 75), cv::Scalar(0, 0, 0), -1);
-        cv::addWeighted(viz_img(cv::Rect(5, 5, 195, 70)), 0.5, viz_img(cv::Rect(5, 5, 195, 70)), 0.5, 0, viz_img(cv::Rect(5, 5, 195, 70)));
-        cv::putText(viz_img, "Left kpts: " + std::to_string(left_count), cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
-        cv::putText(viz_img, "Right kpts: " + std::to_string(right_count), cv::Point(10, 45), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 1);
-        cv::putText(viz_img, "Matches: " + std::to_string(match_count), cv::Point(10, 65), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
     }
 
     void cleanup()
     {
         if (d_input_)
             cudaFree(d_input_);
+        if (d_output_keypoints_)
+            cudaFree(d_output_keypoints_);
         if (stream_)
             cudaStreamDestroy(stream_);
     }
