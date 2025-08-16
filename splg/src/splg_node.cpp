@@ -163,8 +163,7 @@ private:
     std::unique_ptr<IExecutionContext> context_;
 
     // GPU memory buffers
-    void *d_input_;
-    void *d_temp_input_fp32_;
+    void *d_input_fp32_;
     void *d_output_keypoints_fp16_;
     void *d_output_keypoints_fp32_;
 
@@ -176,9 +175,10 @@ private:
     std::vector<float> h_scores_;
 
     // GPU Preprocessing Mats
+    cv::cuda::GpuMat gpu_left_uploaded_, gpu_right_uploaded_;
     cv::cuda::GpuMat gpu_left_resized_, gpu_right_resized_;
     cv::cuda::GpuMat gpu_left_gray_, gpu_right_gray_;
-    cv::cuda::GpuMat gpu_left_norm_, gpu_right_norm_;
+    cv::cuda::GpuMat gpu_left_norm_fp32_, gpu_right_norm_fp32_;
 
     std::string engine_path_;
     int input_height_, input_width_;
@@ -327,22 +327,18 @@ private:
 
     void allocateBuffers()
     {
-        // Allocate final input buffer as FP16
-        size_t input_size_fp16 = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(uint16_t);
-        cudaMalloc(&d_input_, input_size_fp16);
-
-        // Allocate a temporary buffer for preprocessing with FP32 for the GPU path
-        if (use_gpu_preprocessing_)
-        {
-            size_t input_size_fp32 = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(float);
-            cudaMalloc(&d_temp_input_fp32_, input_size_fp32);
-        }
+        // Allocate input buffer as FP32
+        size_t input_size_fp32 = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(float);
+        cudaMalloc(&d_input_fp32_, input_size_fp32);
+        checkCuda("allocating d_input_fp32_");
 
         size_t keypoints_size_fp16 = BATCH_SIZE * max_keypoints_ * 2 * sizeof(uint16_t);
         cudaMalloc(&d_output_keypoints_fp16_, keypoints_size_fp16);
+        checkCuda("allocating d_output_keypoints_fp16_");
 
         size_t keypoints_size_fp32 = BATCH_SIZE * max_keypoints_ * 2 * sizeof(float);
         cudaMalloc(&d_output_keypoints_fp32_, keypoints_size_fp32);
+        checkCuda("allocating d_output_keypoints_fp32_");
 
         h_keypoints_.resize(BATCH_SIZE * max_keypoints_ * 2);
         h_matches_.resize(max_keypoints_ * 3);
@@ -355,7 +351,7 @@ private:
 
     void setupBindingsAndAllocators()
     {
-        context_->setTensorAddress(input_tensor_name_.c_str(), d_input_);
+        context_->setTensorAddress(input_tensor_name_.c_str(), d_input_fp32_);
         context_->setTensorAddress(output_keypoints_name_.c_str(), d_output_keypoints_fp16_);
 
         for (const auto &name : {output_matches_name_, output_scores_name_})
@@ -376,101 +372,81 @@ private:
 
     void preprocessGPU(const cv::Mat &left_img, const cv::Mat &right_img, bool is_grayscale)
     {
-        cv::cuda::GpuMat gpu_imgs[2];
-        cv::cuda::GpuMat gpu_resized_imgs[2];
-        cv::cuda::GpuMat gpu_gray_imgs[2];
-        cv::cuda::GpuMat gpu_norm_imgs[2];
+        gpu_left_uploaded_.upload(left_img, cv_stream_);
+        gpu_right_uploaded_.upload(right_img, cv_stream_);
 
-        // Upload to GPU
-        gpu_imgs[0].upload(left_img, cv_stream_);
-        gpu_imgs[1].upload(right_img, cv_stream_);
-        cv_stream_.waitForCompletion();
-
-        for (int i = 0; i < 2; ++i)
+        // Only resize if image size does not match input size
+        if (gpu_left_uploaded_.cols != input_width_ || gpu_left_uploaded_.rows != input_height_)
         {
-            if (gpu_imgs[i].empty())
-            {
-                std::cerr << "[WARN] GPU image " << i << " is EMPTY after upload!" << std::endl;
-            }
-            else
-            {
-                std::cerr << "[INFO] GPU image " << i << ": "
-                          << gpu_imgs[i].cols << "x" << gpu_imgs[i].rows
-                          << " ch=" << gpu_imgs[i].channels()
-                          << " step=" << gpu_imgs[i].step << std::endl;
-            }
-        }
-
-        // Resize
-        for (int i = 0; i < 2; ++i)
-        {
-            cv::cuda::resize(gpu_imgs[i], gpu_resized_imgs[i],
-                             cv::Size(input_width_, input_height_),
-                             0, 0, cv::INTER_LINEAR, cv_stream_);
-        }
-        cv_stream_.waitForCompletion();
-
-        // Convert to grayscale if needed
-        if (is_grayscale)
-        {
-            for (int i = 0; i < 2; ++i)
-            {
-                if (gpu_resized_imgs[i].channels() == 1)
-                {
-                    gpu_resized_imgs[i].copyTo(gpu_gray_imgs[i], cv_stream_); // deep copy
-                }
-                else
-                {
-                    cv::cuda::cvtColor(gpu_resized_imgs[i], gpu_gray_imgs[i],
-                                       cv::COLOR_BGR2GRAY, 1, cv_stream_);
-                }
-            }
+            cv::cuda::resize(gpu_left_uploaded_, gpu_left_resized_,
+                             cv::Size(input_width_, input_height_), 0, 0, cv::INTER_LINEAR, cv_stream_);
         }
         else
         {
-            for (int i = 0; i < 2; ++i)
-            {
-                gpu_resized_imgs[i].copyTo(gpu_gray_imgs[i], cv_stream_);
-            }
+            // Shallow copy: just assign header, no memory copy
+            gpu_left_resized_ = gpu_left_uploaded_;
         }
-        cv_stream_.waitForCompletion();
 
-        // Normalize to [0,1] float
-        for (int i = 0; i < 2; ++i)
+        if (gpu_right_uploaded_.cols != input_width_ || gpu_right_uploaded_.rows != input_height_)
         {
-            gpu_gray_imgs[i].convertTo(gpu_norm_imgs[i], CV_32F, 1.0 / 255.0, 0.0, cv_stream_);
+            cv::cuda::resize(gpu_right_uploaded_, gpu_right_resized_,
+                             cv::Size(input_width_, input_height_), 0, 0, cv::INTER_LINEAR, cv_stream_);
         }
-        cv_stream_.waitForCompletion();
+        else
+        {
+            gpu_right_resized_ = gpu_right_uploaded_;
+        }
 
-        // Debug — dump normalized images
-        for (int i = 0; i < 2; ++i)
+        cv::cuda::GpuMat *left_gray_ptr = &gpu_left_resized_;
+        cv::cuda::GpuMat *right_gray_ptr = &gpu_right_resized_;
+
+        // convert to grayscale if needed
+        if (!is_grayscale)
         {
-            cv::Mat dbg;
-            gpu_norm_imgs[i].download(dbg, cv_stream_);
-            cv_stream_.waitForCompletion();
-            cv::imwrite("/home/nvidia/ros2_ws/tmp/debug_norm_" + std::to_string(i) + ".png", dbg * 255);
-            std::cerr << "[DEBUG] Saved /home/nvidia/ros2_ws/tmp/debug_norm_" << i << ".png" << std::endl;
+            cv::cuda::cvtColor(gpu_left_resized_, gpu_left_gray_, cv::COLOR_BGR2GRAY, 1, cv_stream_);
+            cv::cuda::cvtColor(gpu_right_resized_, gpu_right_gray_, cv::COLOR_BGR2GRAY, 1, cv_stream_);
+            left_gray_ptr = &gpu_left_gray_;
+            right_gray_ptr = &gpu_right_gray_;
         }
+
+        // normalize to [0,1] float
+        left_gray_ptr->convertTo(gpu_left_norm_fp32_, CV_32F, 1.0 / 255.0, cv_stream_);
+        right_gray_ptr->convertTo(gpu_right_norm_fp32_, CV_32F, 1.0 / 255.0, cv_stream_);
+
+        // Batch copy to input tensor
+        float *d_batch_ptr = static_cast<float *>(d_input_fp32_);
+
+        // Copy left image
+        cudaMemcpy2DAsync(d_batch_ptr,
+                          input_width_ * sizeof(float),
+                          gpu_left_norm_fp32_.ptr<void>(),
+                          gpu_left_norm_fp32_.step,
+                          input_width_ * sizeof(float),
+                          input_height_,
+                          cudaMemcpyDeviceToDevice,
+                          stream_);
+
+        // Copy right image (offset in the batch buffer)
+        cudaMemcpy2DAsync(d_batch_ptr + (input_width_ * input_height_),
+                          input_width_ * sizeof(float),
+                          gpu_right_norm_fp32_.ptr<void>(),
+                          gpu_right_norm_fp32_.step,
+                          input_width_ * sizeof(float),
+                          input_height_,
+                          cudaMemcpyDeviceToDevice,
+                          stream_);
     }
 
-    void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, uint16_t *output, bool is_grayscale)
+    void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *output, bool is_grayscale)
     {
         cv::Mat imgs[2] = {left_img, right_img};
         const int image_area = input_height_ * input_width_;
 
         for (int i = 0; i < 2; ++i)
         {
-            cv::Mat resized_img;
-            if (imgs[i].rows != input_height_ || imgs[i].cols != input_width_)
-            {
-                cv::resize(imgs[i], resized_img, cv::Size(input_width_, input_height_));
-            }
-            else
-            {
-                resized_img = imgs[i];
-            }
+            cv::Mat resized_img, gray_img, float_img;
+            cv::resize(imgs[i], resized_img, cv::Size(input_width_, input_height_));
 
-            cv::Mat gray_img;
             if (!is_grayscale)
             {
                 cv::cvtColor(resized_img, gray_img, cv::COLOR_BGR2GRAY);
@@ -480,93 +456,10 @@ private:
                 gray_img = resized_img;
             }
 
-            cv::Mat float_img;
             gray_img.convertTo(float_img, CV_32FC1, 1.0 / 255.0);
 
-            if (!float_img.isContinuous())
-            {
-                float_img = float_img.clone();
-            }
-
-            float *float_ptr = reinterpret_cast<float *>(float_img.data);
-            uint16_t *buffer_offset = output + i * image_area;
-            for (int p = 0; p < image_area; ++p)
-            {
-                buffer_offset[p] = float_to_half_bits(float_ptr[p]);
-            }
-        }
-    }
-
-    void debugInputTensorFP32(const float *d_fp32, int sample_size, cudaStream_t stream)
-    {
-        std::vector<float> host_fp32(sample_size);
-        cudaMemcpyAsync(host_fp32.data(), d_fp32,
-                        sample_size * sizeof(float),
-                        cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
-
-        RCLCPP_INFO(this->get_logger(), "[DEBUG FP32] First 10 values:");
-        for (int i = 0; i < 10; ++i)
-            RCLCPP_INFO(this->get_logger(), "  Pixel[%d]: %.6f", i, host_fp32[i]);
-
-        auto [min_it, max_it] = std::minmax_element(host_fp32.begin(), host_fp32.end());
-        RCLCPP_INFO(this->get_logger(), "[DEBUG FP32] Range: [%.6f, %.6f]", *min_it, *max_it);
-    }
-
-    void debugInputTensorFP16(const __half *d_fp16, int sample_size, cudaStream_t stream)
-    {
-        std::vector<float> host_fp32(sample_size);
-
-        // Temporary GPU buffer for FP32
-        float *d_temp_fp32 = nullptr;
-        cudaMalloc(&d_temp_fp32, sample_size * sizeof(float));
-
-        // Convert FP16 → FP32 for inspection
-        launchConvertFP16ToFP32(d_fp16, d_temp_fp32, sample_size, stream);
-
-        cudaMemcpyAsync(host_fp32.data(), d_temp_fp32,
-                        sample_size * sizeof(float),
-                        cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
-        cudaFree(d_temp_fp32);
-
-        RCLCPP_INFO(this->get_logger(), "[DEBUG FP16] First 10 values:");
-        for (int i = 0; i < 10; ++i)
-            RCLCPP_INFO(this->get_logger(), "  Pixel[%d]: %.6f", i, host_fp32[i]);
-
-        auto [min_it, max_it] = std::minmax_element(host_fp32.begin(), host_fp32.end());
-        RCLCPP_INFO(this->get_logger(), "[DEBUG FP16] Range: [%.6f, %.6f]", *min_it, *max_it);
-    }
-
-    void debugRawInput(const cv::Mat &left_img, const cv::Mat &right_img)
-    {
-        RCLCPP_INFO(this->get_logger(), "Raw image info:");
-        RCLCPP_INFO(this->get_logger(), " Left: %dx%d, channels=%d, type=%d",
-                    left_img.cols, left_img.rows, left_img.channels(), left_img.type());
-        RCLCPP_INFO(this->get_logger(), " Right: %dx%d, channels=%d, type=%d",
-                    right_img.cols, right_img.rows, right_img.channels(), right_img.type());
-        // Check if images have data
-
-        if (left_img.empty() || right_img.empty())
-        {
-            RCLCPP_ERROR(this->get_logger(), "Input images are empty!");
-            return;
-        }
-
-        // Sample pixel values from raw images
-        RCLCPP_INFO(this->get_logger(), "Raw pixel samples:");
-        for (int i = 0; i < 5; ++i)
-        {
-            if (left_img.channels() == 3)
-            {
-                cv::Vec3b pixel = left_img.at<cv::Vec3b>(100, 100 + i);
-                RCLCPP_INFO(this->get_logger(), " Left[%d]: (%d,%d,%d)", i, pixel[0], pixel[1], pixel[2]);
-            }
-            else
-            {
-                uint8_t pixel = left_img.at<uint8_t>(100, 100 + i);
-                RCLCPP_INFO(this->get_logger(), " Left[%d]: %d", i, pixel);
-            }
+            // Copy to the output buffer
+            memcpy(output + i * image_area, float_img.data, image_area * sizeof(float));
         }
     }
 
@@ -586,7 +479,6 @@ private:
 
             cv_bridge::CvImagePtr left_cv = cv_bridge::toCvCopy(left_msg, desired_encoding);
             cv_bridge::CvImagePtr right_cv = cv_bridge::toCvCopy(right_msg, desired_encoding);
-            debugRawInput(left_cv->image, right_cv->image);
 
             if (left_cv->image.empty() || right_cv->image.empty())
             {
@@ -598,21 +490,13 @@ private:
             if (use_gpu_preprocessing_)
             {
                 preprocessGPU(left_cv->image, right_cv->image, is_grayscale);
-                // const int elements = BATCH_SIZE * CHANNELS * input_height_ * input_width_;
-                // debugInputTensorFP16(
-                //     reinterpret_cast<const __half *>(d_input_),
-                //     elements,
-                //     stream_);
-                // debugInputTensorFP32(
-                //     reinterpret_cast<const float *>(d_temp_input_fp32_),
-                //     elements,
-                //     stream_);
+                const int elements = BATCH_SIZE * CHANNELS * input_height_ * input_width_;
             }
             else
             {
-                std::vector<uint16_t> h_input(BATCH_SIZE * CHANNELS * input_height_ * input_width_);
+                std::vector<float> h_input(BATCH_SIZE * CHANNELS * input_height_ * input_width_);
                 preprocessCPU(left_cv->image, right_cv->image, h_input.data(), is_grayscale);
-                cudaMemcpyAsync(d_input_, h_input.data(), h_input.size() * sizeof(uint16_t), cudaMemcpyHostToDevice, stream_);
+                cudaMemcpyAsync(d_input_fp32_, h_input.data(), h_input.size() * sizeof(float), cudaMemcpyHostToDevice, stream_);
             }
 
             nvinfer1::Dims input_dims;
@@ -859,10 +743,8 @@ private:
 
     void cleanup()
     {
-        if (d_input_)
-            cudaFree(d_input_);
-        if (d_temp_input_fp32_)
-            cudaFree(d_temp_input_fp32_);
+        if (d_input_fp32_)
+            cudaFree(d_input_fp32_);
         if (d_output_keypoints_fp16_)
             cudaFree(d_output_keypoints_fp16_);
         if (d_output_keypoints_fp32_)
