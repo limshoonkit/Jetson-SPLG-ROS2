@@ -132,11 +132,6 @@ public:
         allocateBuffers();
         setupBindingsAndAllocators();
 
-        if (use_gpu_preprocessing_)
-        {
-            initGPUPreprocessing();
-        }
-
         left_image_sub_.subscribe(this, "/image1");
         right_image_sub_.subscribe(this, "/image2");
 
@@ -170,16 +165,15 @@ private:
     std::unique_ptr<IExecutionContext> context_;
 
     // GPU memory buffers
-    void *d_input_;            // Input tensor
-    void *d_output_keypoints_; // Output keypoints tensor
+    void *d_input_;
     std::unordered_map<std::string, std::unique_ptr<DynamicOutputAllocator>> mAllocatorMap;
 
     // Host memory buffers for results
-    std::vector<uint64_t> h_keypoints_;
-    std::vector<uint64_t> h_matches_;
+    std::vector<int64_t> h_keypoints_;
+    std::vector<int64_t> h_matches_;
     std::vector<float> h_scores_;
 
-    // GPU Preprocessing Mats with pre-allocation
+    // GPU Preprocessing Mats
     cv::cuda::GpuMat gpu_left_uploaded_, gpu_right_uploaded_;
     cv::cuda::GpuMat gpu_left_resized_, gpu_right_resized_;
     cv::cuda::GpuMat gpu_left_gray_, gpu_right_gray_;
@@ -211,7 +205,6 @@ private:
     static constexpr int CHANNELS = 1;
 
     cudaStream_t stream_;
-    // cv::cuda::Stream cv_stream_;
 
     // Performance monitoring
     std::chrono::high_resolution_clock::time_point preprocess_start_, inference_start_;
@@ -265,47 +258,61 @@ private:
         for (int32_t i = 0; i < nbIOTensors; ++i)
         {
             const char *tensorName = engine_->getIOTensorName(i);
+            auto dtype = engine_->getTensorDataType(tensorName);
+            std::string dtype_str = "OTHER";
+            if (dtype == DataType::kFLOAT)
+                dtype_str = "FLOAT32";
+            else if (dtype == DataType::kHALF)
+                dtype_str = "HALF";
+            else if (dtype == DataType::kINT64)
+                dtype_str = "INT64";
+            else if (dtype == DataType::kINT32)
+                dtype_str = "INT32";
+            else if (dtype == DataType::kINT8)
+                dtype_str = "INT8";
+            else if (dtype == DataType::kBOOL)
+                dtype_str = "BOOL";
+
             if (engine_->getTensorIOMode(tensorName) == TensorIOMode::kINPUT)
             {
                 input_tensor_name_ = tensorName;
+                RCLCPP_INFO(this->get_logger(), "Found Input tensor '%s' with dtype: %s", tensorName, dtype_str.c_str());
             }
             else
             {
-                std::string name = tensorName;
-                if (name == "keypoints")
+                std::string name(tensorName);
+                if (name.find("keypoints") != std::string::npos)
                     output_keypoints_name_ = name;
-                else if (name == "matches")
+                else if (name.find("matches") != std::string::npos)
                     output_matches_name_ = name;
-                else if (name == "mscores")
+                else if (name.find("scores") != std::string::npos)
                     output_scores_name_ = name;
+                RCLCPP_INFO(this->get_logger(), "Found Output tensor '%s' with dtype: %s", tensorName, dtype_str.c_str());
             }
         }
-        RCLCPP_INFO(this->get_logger(), "Input: %s, Keypoints: %s, Matches: %s, Scores: %s",
+        RCLCPP_INFO(this->get_logger(), "Using I/O tensors: Input='%s', Keypoints='%s', Matches='%s', Scores='%s'",
                     input_tensor_name_.c_str(), output_keypoints_name_.c_str(),
                     output_matches_name_.c_str(), output_scores_name_.c_str());
     }
 
     void allocateBuffers()
     {
-        // Allocate buffer for input and output tensors
+        // Allocate buffer for input tensor. Output buffers are handled by DynamicOutputAllocator.
         size_t input_size = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(float); // NCHW (2, 1, H, W)
-        size_t output_keypoints_size = BATCH_SIZE * max_keypoints_ * 2 * sizeof(uint64_t);           // (2, max_keypoints, 2)
 
         if (use_unified_memory_)
         {
             CUDA_CHECK(cudaMallocManaged(&d_input_, input_size));
-            CUDA_CHECK(cudaMallocManaged(&d_output_keypoints_, output_keypoints_size));
         }
         else
         {
             CUDA_CHECK(cudaMalloc(&d_input_, input_size));
-            CUDA_CHECK(cudaMalloc(&d_output_keypoints_, output_keypoints_size));
         }
 
-        // Host buffers for results - pre-allocate maximum sizes
-        h_keypoints_.resize(BATCH_SIZE * max_keypoints_ * 2);
-        h_matches_.resize(max_keypoints_ * 3); // (-1, 3)
-        h_scores_.resize(max_keypoints_);      // (-1)
+        // Host buffers for results.
+        h_keypoints_.reserve(BATCH_SIZE * max_keypoints_ * 2);
+        h_matches_.reserve(max_keypoints_ * 3);
+        h_scores_.reserve(max_keypoints_);
 
         last_process_time_ = std::chrono::steady_clock::now();
         RCLCPP_INFO(this->get_logger(), "Frame skipping: %s (N=%d, rate=%.1fHz)",
@@ -316,24 +323,20 @@ private:
     {
         if (profile_inference_)
         {
-            auto input_shape = engine_->getTensorShape(input_tensor_name_.c_str());
-            if (input_shape.nbDims == 4)
-                RCLCPP_WARN(this->get_logger(), "Input shape: %ld, %ld, %ld, %ld", input_shape.d[0],
-                            input_shape.d[1], input_shape.d[2], input_shape.d[3]);
-
-            auto output_keypoints_shape = engine_->getTensorShape(output_keypoints_name_.c_str());
-            if (output_keypoints_shape.nbDims == 3)
-                RCLCPP_WARN(this->get_logger(), "Output keypoints shape: %ld, %ld, %ld", output_keypoints_shape.d[0],
-                            output_keypoints_shape.d[1], output_keypoints_shape.d[2]);
-
-            auto output_matches_shape = engine_->getTensorShape(output_matches_name_.c_str());
-            if (output_matches_shape.nbDims == 2)
-                RCLCPP_WARN(this->get_logger(), "Output matches shape: %ld, %ld", output_matches_shape.d[0],
-                            output_matches_shape.d[1]);
-
-            auto output_scores_shape = engine_->getTensorShape(output_scores_name_.c_str());
-            if (output_scores_shape.nbDims == 1)
-                RCLCPP_WARN(this->get_logger(), "Output scores shape: %ld", output_scores_shape.d[0]);
+            auto print_shape = [this](const char *name)
+            {
+                if (std::string(name).empty())
+                    return;
+                auto shape = engine_->getTensorShape(name);
+                std::string shape_str;
+                for (int i = 0; i < shape.nbDims; ++i)
+                    shape_str += std::to_string(shape.d[i]) + ", ";
+                RCLCPP_WARN(this->get_logger(), "Tensor '%s' shape: [ %s]", name, shape_str.c_str());
+            };
+            print_shape(input_tensor_name_.c_str());
+            print_shape(output_keypoints_name_.c_str());
+            print_shape(output_matches_name_.c_str());
+            print_shape(output_scores_name_.c_str());
         }
 
         // Set fixed input tensor address and shape
@@ -341,10 +344,7 @@ private:
         context_->setInputShape(input_tensor_name_.c_str(),
                                 nvinfer1::Dims4{BATCH_SIZE, CHANNELS, input_height_, input_width_});
 
-        // Set output tensor address and shape
-        context_->setOutputTensorAddress(output_keypoints_name_.c_str(), d_output_keypoints_);
-
-        // Use dynamic allocators for all outputs
+        // Use dynamic allocators for all outputs.
         for (const auto &name : {output_keypoints_name_, output_matches_name_, output_scores_name_})
         {
             if (!name.empty())
@@ -356,10 +356,6 @@ private:
         }
     }
 
-    void initGPUPreprocessing()
-    {
-    }
-
     void preprocessGPU(const cv::Mat &left_img, const cv::Mat &right_img, bool is_grayscale)
     {
         if (profile_inference_)
@@ -367,23 +363,13 @@ private:
             preprocess_start_ = std::chrono::high_resolution_clock::now();
         }
 
-        // Ensure images are the expected size and format
         CV_Assert(left_img.rows == input_height_ && left_img.cols == input_width_);
         CV_Assert(right_img.rows == input_height_ && right_img.cols == input_width_);
         CV_Assert(left_img.type() == CV_8UC1 && right_img.type() == CV_8UC1);
 
-        cv::cuda::GpuMat d_left, d_right;
-        d_left.upload(left_img);
-        d_right.upload(right_img);
+        cv::cuda::GpuMat d_left(left_img);
+        cv::cuda::GpuMat d_right(right_img);
         launchToNCHW(d_left, d_right, d_input_, input_height_, input_width_);
-
-        CUDA_CHECK(cudaGetLastError());
-
-        if (!use_unified_memory_)
-        {
-            // Synchronize to ensure kernel completion before inference
-            CUDA_CHECK(cudaDeviceSynchronize());
-        }
 
         if (profile_inference_)
         {
@@ -396,19 +382,7 @@ private:
 
     void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *output, bool is_grayscale)
     {
-        if (profile_inference_)
-        {
-            preprocess_start_ = std::chrono::high_resolution_clock::now();
-        }
-
-        // TODO: Implement CPU preprocessing
-
-        if (profile_inference_)
-        {
-            auto preprocess_end = std::chrono::high_resolution_clock::now();
-            auto preprocess_time = std::chrono::duration_cast<std::chrono::microseconds>(preprocess_end - preprocess_start_).count() / 1000.0;
-            RCLCPP_INFO(this->get_logger(), "CPU Preprocessing: %.2f ms", preprocess_time);
-        }
+        // TODO: Implement CPU preprocessing if needed
     }
 
     void stereoCallback(
@@ -422,11 +396,8 @@ private:
 
         try
         {
-            bool is_grayscale = (left_msg->encoding == "mono8");
-            const char *desired_encoding = is_grayscale ? "mono8" : "bgr8";
-
-            cv_bridge::CvImagePtr left_cv = cv_bridge::toCvCopy(left_msg, desired_encoding);
-            cv_bridge::CvImagePtr right_cv = cv_bridge::toCvCopy(right_msg, desired_encoding);
+            cv_bridge::CvImagePtr left_cv = cv_bridge::toCvCopy(left_msg, "mono8");
+            cv_bridge::CvImagePtr right_cv = cv_bridge::toCvCopy(right_msg, "mono8");
 
             if (left_cv->image.empty() || right_cv->image.empty())
             {
@@ -438,12 +409,12 @@ private:
             // Preprocessing
             if (use_gpu_preprocessing_)
             {
-                preprocessGPU(left_cv->image, right_cv->image, is_grayscale);
+                preprocessGPU(left_cv->image, right_cv->image, true);
             }
             else
             {
                 std::vector<float> h_input(BATCH_SIZE * CHANNELS * input_height_ * input_width_);
-                preprocessCPU(left_cv->image, right_cv->image, h_input.data(), is_grayscale);
+                preprocessCPU(left_cv->image, right_cv->image, h_input.data(), true);
                 CUDA_CHECK(cudaMemcpyAsync(d_input_, h_input.data(), h_input.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
             }
 
@@ -460,21 +431,41 @@ private:
                 return;
             }
 
-            // TODO: Handle output tensors
+            // Keypoints
+            auto &keypoints_allocator = mAllocatorMap.at(output_keypoints_name_);
+            auto keypoints_shape = keypoints_allocator->getShape();
+            actual_num_keypoints_ = (keypoints_shape.nbDims == 3) ? keypoints_shape.d[1] : 0; // Shape [2, N, 2]
+            size_t keypoints_count = BATCH_SIZE * actual_num_keypoints_ * 2;
+            h_keypoints_.resize(keypoints_count);
+            CUDA_CHECK(cudaMemcpyAsync(h_keypoints_.data(), keypoints_allocator->getBuffer(), keypoints_count * sizeof(int64_t), cudaMemcpyDeviceToHost, stream_));
+
+            // Matches
+            auto &matches_allocator = mAllocatorMap.at(output_matches_name_);
+            auto matches_shape = matches_allocator->getShape();
+            actual_num_matches_ = (matches_shape.nbDims == 2) ? matches_shape.d[0] : 0; // Shape [M, 3]
+            size_t matches_count = actual_num_matches_ * 3;
+            h_matches_.resize(matches_count);
+            CUDA_CHECK(cudaMemcpyAsync(h_matches_.data(), matches_allocator->getBuffer(), matches_count * sizeof(int64_t), cudaMemcpyDeviceToHost, stream_));
+
+            // Scores
+            auto &scores_allocator = mAllocatorMap.at(output_scores_name_);
+            auto scores_shape = scores_allocator->getShape();
+            size_t scores_count = (scores_shape.nbDims == 1) ? scores_shape.d[0] : 0; // Shape [M]
+            h_scores_.resize(scores_count);
+            CUDA_CHECK(cudaMemcpyAsync(h_scores_.data(), scores_allocator->getBuffer(), scores_count * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+
+            // Synchronize after all async copies are queued to ensure data is on host
+            CUDA_CHECK(cudaStreamSynchronize(stream_));
 
             if (profile_inference_)
             {
-                CUDA_CHECK(cudaStreamSynchronize(stream_));
                 auto inference_end = std::chrono::high_resolution_clock::now();
                 auto inference_time = std::chrono::duration_cast<std::chrono::microseconds>(inference_end - inference_start_).count() / 1000.0;
                 RCLCPP_INFO(this->get_logger(), "Inference: %.2f ms", inference_time);
-            }
 
-            auto pipeline_end = std::chrono::high_resolution_clock::now();
-            if (profile_inference_)
-            {
+                auto pipeline_end = std::chrono::high_resolution_clock::now();
                 auto total_time = std::chrono::duration_cast<std::chrono::microseconds>(pipeline_end - pipeline_start).count() / 1000.0;
-                RCLCPP_INFO(this->get_logger(), "Total pipeline: %.2f ms, Keypoints: %d, Matches: %d",
+                RCLCPP_INFO(this->get_logger(), "Total pipeline: %.2f ms, Keypoints/img: %d, Matches: %d",
                             total_time, actual_num_keypoints_, actual_num_matches_);
             }
 
@@ -519,46 +510,47 @@ private:
 
     void parseKeypoints(std::vector<cv::Point2f> &left_kpts, std::vector<cv::Point2f> &right_kpts)
     {
-        left_kpts.resize(max_keypoints_);
-        right_kpts.resize(max_keypoints_);
-        const int kpts_per_image = max_keypoints_ * 2;
-        for (int i = 0; i < max_keypoints_; ++i)
+        left_kpts.resize(actual_num_keypoints_);
+        right_kpts.resize(actual_num_keypoints_);
+        const int kpts_per_image_flat_size = actual_num_keypoints_ * 2;
+
+        for (int i = 0; i < actual_num_keypoints_; ++i)
         {
-            left_kpts[i] = cv::Point2f(h_keypoints_[i * 2], h_keypoints_[i * 2 + 1]);
-            right_kpts[i] = cv::Point2f(h_keypoints_[kpts_per_image + i * 2], h_keypoints_[kpts_per_image + i * 2 + 1]);
+            // Left image (image 0) keypoints are at the start of the buffer
+            left_kpts[i] = cv::Point2f(
+                static_cast<float>(h_keypoints_[i * 2]),
+                static_cast<float>(h_keypoints_[i * 2 + 1]));
+
+            // Right image (image 1) keypoints are offset by the size of the first image's data
+            right_kpts[i] = cv::Point2f(
+                static_cast<float>(h_keypoints_[kpts_per_image_flat_size + i * 2]),
+                static_cast<float>(h_keypoints_[kpts_per_image_flat_size + i * 2 + 1]));
         }
     }
 
-    void parseMatches(std::vector<cv::DMatch> &matches,
-                      const std::vector<cv::Point2f> &left_kpts,
-                      const std::vector<cv::Point2f> &right_kpts)
+    void parseMatches(std::vector<cv::DMatch> &final_matches)
     {
-        matches.clear();
-        int num_candidates = std::min(actual_num_matches_, static_cast<int>(h_scores_.size()));
+        final_matches.clear();
+        final_matches.reserve(actual_num_matches_);
 
-        for (int i = 0; i < num_candidates; ++i)
+        for (int i = 0; i < actual_num_matches_; ++i)
         {
-            int left_idx = h_matches_[i * 3];
-            int right_idx = h_matches_[i * 3 + 1];
-            float confidence = h_scores_[i];
+            // Match layout: [batch_idx, query_idx, train_idx]
+            int64_t query_idx = h_matches_[i * 3 + 1];
+            int64_t train_idx = h_matches_[i * 3 + 2];
+            float score = h_scores_[i];
 
-            if (left_idx >= 0 && left_idx < static_cast<int>(left_kpts.size()) &&
-                right_idx >= 0 && right_idx < static_cast<int>(right_kpts.size()) &&
-                left_kpts[left_idx].x >= 0 && right_kpts[right_idx].x >= 0 &&
-                confidence > 0.1f)
+            // Ensure indices are within bounds of the keypoint vectors
+            if (query_idx >= 0 && query_idx < actual_num_keypoints_ &&
+                train_idx >= 0 && train_idx < actual_num_keypoints_)
             {
-                matches.emplace_back(left_idx, right_idx, 1.0f - confidence);
+                // cv::DMatch(queryIdx, trainIdx, distance/score)
+                final_matches.emplace_back(
+                    static_cast<int>(query_idx),
+                    static_cast<int>(train_idx),
+                    score);
             }
         }
-    }
-
-    cv::Scalar getMatchColor(float confidence)
-    {
-        float hue = std::min(1.0f - confidence, 1.0f) * 60.0f; // Red (bad) to Green (good)
-        cv::Mat hsv(1, 1, CV_8UC3, cv::Scalar(hue, 255, 255));
-        cv::Mat bgr;
-        cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
-        return cv::Scalar(bgr.at<cv::Vec3b>(0, 0));
     }
 
     void processAndPublishResults(const cv::Mat &left_img, const cv::Mat &right_img,
@@ -567,73 +559,33 @@ private:
         if (matches_pub_->get_subscription_count() == 0)
             return;
 
+        std::vector<cv::Point2f> kpts_left_raw, kpts_right_raw;
+        parseKeypoints(kpts_left_raw, kpts_right_raw);
+
+        std::vector<cv::DMatch> all_matches;
+        parseMatches(all_matches);
+
         cv::Mat viz_img;
         cv::hconcat(left_img, right_img, viz_img);
         if (viz_img.channels() == 1)
             cv::cvtColor(viz_img, viz_img, cv::COLOR_GRAY2BGR);
 
-        const float scale_x = static_cast<float>(left_img.cols) / input_width_;
-        const float scale_y = static_cast<float>(left_img.rows) / input_height_;
-
-        std::vector<cv::Point2f> kpts_left_raw, kpts_right_raw;
-        parseKeypoints(kpts_left_raw, kpts_right_raw);
-
-        std::vector<cv::DMatch> all_matches;
-        parseMatches(all_matches, kpts_left_raw, kpts_right_raw);
-
-        std::vector<bool> left_matched(kpts_left_raw.size(), false);
-        std::vector<bool> right_matched(kpts_right_raw.size(), false);
-        std::vector<float> match_confidences(kpts_left_raw.size(), 0.f);
+        const cv::Scalar kMatchColor(0, 255, 0);
 
         for (const auto &match : all_matches)
         {
-            left_matched[match.queryIdx] = true;
-            right_matched[match.trainIdx] = true;
-            match_confidences[match.queryIdx] = 1.0f - match.distance;
+            cv::Point2f pt_left = kpts_left_raw[match.queryIdx];
+            cv::Point2f pt_right = kpts_right_raw[match.trainIdx];
+            cv::Point2f pt_right_offset(pt_right.x + left_img.cols, pt_right.y);
+
+            // Use the constant color for everything
+            cv::line(viz_img, pt_left, pt_right_offset, kMatchColor, 1);
+            cv::circle(viz_img, pt_left, 3, kMatchColor, cv::FILLED);
+            cv::circle(viz_img, pt_right_offset, 3, kMatchColor, cv::FILLED);
         }
 
-        for (const auto &match : all_matches)
-        {
-            cv::Point2f pt1_raw = kpts_left_raw[match.queryIdx];
-            cv::Point2f pt2_raw = kpts_right_raw[match.trainIdx];
-            cv::Point pt1(cvRound(pt1_raw.x * scale_x), cvRound(pt1_raw.y * scale_y));
-            cv::Point pt2(cvRound(pt2_raw.x * scale_x) + left_img.cols, cvRound(pt2_raw.y * scale_y));
-            cv::Scalar color = getMatchColor(1.0f - match.distance);
-            cv::line(viz_img, pt1, pt2, color, 1, cv::LINE_AA);
-        }
-
-        for (size_t i = 0; i < kpts_left_raw.size(); ++i)
-        {
-            if (kpts_left_raw[i].x < 0)
-                continue;
-            cv::Point pt(cvRound(kpts_left_raw[i].x * scale_x), cvRound(kpts_left_raw[i].y * scale_y));
-            cv::Scalar color = left_matched[i] ? getMatchColor(match_confidences[i]) : cv::Scalar(0, 0, 255); // Red if unmatched
-            cv::circle(viz_img, pt, 2, color, -1, cv::LINE_AA);
-        }
-
-        for (size_t i = 0; i < kpts_right_raw.size(); ++i)
-        {
-            if (kpts_right_raw[i].x < 0)
-                continue;
-            cv::Point pt(cvRound(kpts_right_raw[i].x * scale_x) + left_img.cols, cvRound(kpts_right_raw[i].y * scale_y));
-            // To color right points, we need to find the match it's part of
-            cv::Scalar color = cv::Scalar(0, 0, 255); // Red if unmatched
-            if (right_matched[i])
-            {
-                // This is slightly inefficient but fine for visualization
-                for (const auto &m : all_matches)
-                {
-                    if (m.trainIdx == static_cast<int>(i))
-                    {
-                        color = getMatchColor(1.0f - m.distance);
-                        break;
-                    }
-                }
-            }
-            cv::circle(viz_img, pt, 2, color, -1, cv::LINE_AA);
-        }
-
-        cv::putText(viz_img, "Matches: " + std::to_string(all_matches.size()), cv::Point(10, 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 20, 20), 1);
+        std::string text = "Matches: " + std::to_string(all_matches.size());
+        cv::putText(viz_img, text, cv::Point(10, 20), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
 
         auto viz_msg = cv_bridge::CvImage(header, "bgr8", viz_img).toImageMsg();
         matches_pub_->publish(*viz_msg);
@@ -643,8 +595,6 @@ private:
     {
         if (d_input_)
             cudaFree(d_input_);
-        if (d_output_keypoints_)
-            cudaFree(d_output_keypoints_);
         if (stream_)
             cudaStreamDestroy(stream_);
     }
