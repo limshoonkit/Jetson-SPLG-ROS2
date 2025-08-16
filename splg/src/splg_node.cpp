@@ -170,13 +170,13 @@ private:
     std::unique_ptr<IExecutionContext> context_;
 
     // GPU memory buffers
-    void *d_input_; // Input tensor
+    void *d_input_;            // Input tensor
     void *d_output_keypoints_; // Output keypoints tensor
     std::unordered_map<std::string, std::unique_ptr<DynamicOutputAllocator>> mAllocatorMap;
 
     // Host memory buffers for results
-    std::vector<float> h_keypoints_;
-    std::vector<int> h_matches_;
+    std::vector<uint64_t> h_keypoints_;
+    std::vector<uint64_t> h_matches_;
     std::vector<float> h_scores_;
 
     // GPU Preprocessing Mats with pre-allocation
@@ -202,10 +202,10 @@ private:
     std::chrono::steady_clock::time_point last_process_time_;
     int frame_counter_{0};
 
-    std::string input_tensor_name_;
-    std::string output_keypoints_name_;
-    std::string output_matches_name_;
-    std::string output_scores_name_;
+    std::string input_tensor_name_;     // FLOAT32
+    std::string output_keypoints_name_; // INT64
+    std::string output_matches_name_;   // INT64
+    std::string output_scores_name_;    // FLOAT32
 
     static constexpr int BATCH_SIZE = 2;
     static constexpr int CHANNELS = 1;
@@ -289,7 +289,7 @@ private:
     {
         // Allocate buffer for input and output tensors
         size_t input_size = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(float); // NCHW (2, 1, H, W)
-        size_t output_keypoints_size = BATCH_SIZE * max_keypoints_ * 2 * sizeof(float); // (2, max_keypoints, 2)
+        size_t output_keypoints_size = BATCH_SIZE * max_keypoints_ * 2 * sizeof(uint64_t);           // (2, max_keypoints, 2)
 
         if (use_unified_memory_)
         {
@@ -305,7 +305,7 @@ private:
         // Host buffers for results - pre-allocate maximum sizes
         h_keypoints_.resize(BATCH_SIZE * max_keypoints_ * 2);
         h_matches_.resize(max_keypoints_ * 3); // (-1, 3)
-        h_scores_.resize(max_keypoints_); // (-1)
+        h_scores_.resize(max_keypoints_);      // (-1)
 
         last_process_time_ = std::chrono::steady_clock::now();
         RCLCPP_INFO(this->get_logger(), "Frame skipping: %s (N=%d, rate=%.1fHz)",
@@ -358,7 +358,6 @@ private:
 
     void initGPUPreprocessing()
     {
-        // TODO: Implement GPU preprocessing
     }
 
     void preprocessGPU(const cv::Mat &left_img, const cv::Mat &right_img, bool is_grayscale)
@@ -368,7 +367,23 @@ private:
             preprocess_start_ = std::chrono::high_resolution_clock::now();
         }
 
-        // TODO: Implement GPU preprocessing
+        // Ensure images are the expected size and format
+        CV_Assert(left_img.rows == input_height_ && left_img.cols == input_width_);
+        CV_Assert(right_img.rows == input_height_ && right_img.cols == input_width_);
+        CV_Assert(left_img.type() == CV_8UC1 && right_img.type() == CV_8UC1);
+
+        cv::cuda::GpuMat d_left, d_right;
+        d_left.upload(left_img);
+        d_right.upload(right_img);
+        launchToNCHW(d_left, d_right, d_input_, input_height_, input_width_);
+
+        CUDA_CHECK(cudaGetLastError());
+
+        if (!use_unified_memory_)
+        {
+            // Synchronize to ensure kernel completion before inference
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
 
         if (profile_inference_)
         {
@@ -445,6 +460,8 @@ private:
                 return;
             }
 
+            // TODO: Handle output tensors
+
             if (profile_inference_)
             {
                 CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -452,8 +469,6 @@ private:
                 auto inference_time = std::chrono::duration_cast<std::chrono::microseconds>(inference_end - inference_start_).count() / 1000.0;
                 RCLCPP_INFO(this->get_logger(), "Inference: %.2f ms", inference_time);
             }
-
-            // TODO: Process outputs
 
             auto pipeline_end = std::chrono::high_resolution_clock::now();
             if (profile_inference_)
@@ -618,7 +633,7 @@ private:
             cv::circle(viz_img, pt, 2, color, -1, cv::LINE_AA);
         }
 
-        cv::putText(viz_img, "Matches: " + std::to_string(all_matches.size()), cv::Point(10, 65), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
+        cv::putText(viz_img, "Matches: " + std::to_string(all_matches.size()), cv::Point(10, 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 20, 20), 1);
 
         auto viz_msg = cv_bridge::CvImage(header, "bgr8", viz_img).toImageMsg();
         matches_pub_->publish(*viz_msg);
