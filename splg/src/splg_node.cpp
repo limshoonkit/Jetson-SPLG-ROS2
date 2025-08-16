@@ -27,14 +27,16 @@
 
 using namespace nvinfer1;
 
-inline void checkCuda(const char *where)
-{
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        std::cerr << "CUDA error after " << where << ": " << cudaGetErrorString(err) << std::endl;
-    }
-}
+#define CUDA_CHECK(call)                                                                                                     \
+    do                                                                                                                       \
+    {                                                                                                                        \
+        cudaError_t error = call;                                                                                            \
+        if (error != cudaSuccess)                                                                                            \
+        {                                                                                                                    \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " << cudaGetErrorString(error) << std::endl; \
+            exit(1);                                                                                                         \
+        }                                                                                                                    \
+    } while (0)
 
 // https://github.com/NVIDIA/TensorRT/issues/4120
 class DynamicOutputAllocator : public nvinfer1::IOutputAllocator
@@ -106,6 +108,7 @@ public:
         declare_parameter("frame_skip_mode", "every_nth"); // "every_nth", "rate_limit", "none"
         declare_parameter("frame_skip_n", 2);
         declare_parameter("max_process_rate_hz", 20.0);
+        declare_parameter("use_unified_memory", false); // For Jetson Orin optimization
 
         engine_path_ = get_parameter("engine_path").as_string();
         input_height_ = get_parameter("input_height").as_int();
@@ -116,6 +119,7 @@ public:
         frame_skip_mode_ = get_parameter("frame_skip_mode").as_string();
         frame_skip_n_ = get_parameter("frame_skip_n").as_int();
         max_process_rate_hz_ = get_parameter("max_process_rate_hz").as_double();
+        use_unified_memory_ = get_parameter("use_unified_memory").as_bool();
 
         if (!initTensorRT())
         {
@@ -141,7 +145,10 @@ public:
         sync_->registerCallback(&SuperPointLightGlueNode::stereoCallback, this);
 
         matches_pub_ = this->create_publisher<sensor_msgs::msg::Image>("feature_matches_viz", 1);
-        RCLCPP_INFO(this->get_logger(), "SuperPoint-LightGlue node initialized [%dx%d]", input_width_, input_height_);
+        RCLCPP_INFO(this->get_logger(), "SuperPoint-LightGlue node initialized [%dx%d] GPU:%s Unified:%s",
+                    input_width_, input_height_,
+                    use_gpu_preprocessing_ ? "ON" : "OFF",
+                    use_unified_memory_ ? "ON" : "OFF");
     }
 
     ~SuperPointLightGlueNode()
@@ -163,16 +170,15 @@ private:
     std::unique_ptr<IExecutionContext> context_;
 
     // GPU memory buffers
-    void *d_input_;                // Input tensor (FP32)
-    void *d_output_keypoints_;     // Output keypoints tensor
+    void *d_input_; // Input tensor (FP32)
     std::unordered_map<std::string, std::unique_ptr<DynamicOutputAllocator>> mAllocatorMap;
 
-    // Host memory buffers
+    // Host memory buffers for results
     std::vector<float> h_keypoints_;
     std::vector<int> h_matches_;
     std::vector<float> h_scores_;
 
-    // GPU Preprocessing Mats
+    // GPU Preprocessing Mats with pre-allocation
     cv::cuda::GpuMat gpu_left_uploaded_, gpu_right_uploaded_;
     cv::cuda::GpuMat gpu_left_resized_, gpu_right_resized_;
     cv::cuda::GpuMat gpu_left_gray_, gpu_right_gray_;
@@ -183,7 +189,9 @@ private:
     int max_keypoints_;
     bool profile_inference_;
     bool use_gpu_preprocessing_;
+    bool use_unified_memory_;
     int actual_num_matches_;
+    int actual_num_keypoints_;
 
     std::string frame_skip_mode_;
     int frame_skip_n_;
@@ -203,6 +211,9 @@ private:
 
     cudaStream_t stream_;
     cv::cuda::Stream cv_stream_;
+
+    // Performance monitoring
+    std::chrono::high_resolution_clock::time_point preprocess_start_, inference_start_;
 
     class Logger : public ILogger
     {
@@ -243,7 +254,7 @@ private:
         if (!context_)
             return false;
 
-        cudaStreamCreate(&stream_);
+        CUDA_CHECK(cudaStreamCreate(&stream_));
         return true;
     }
 
@@ -277,15 +288,17 @@ private:
     {
         // Allocate input buffer for normalized images (FP32)
         size_t input_size = BATCH_SIZE * CHANNELS * input_height_ * input_width_ * sizeof(float);
-        cudaMalloc(&d_input_, input_size);
-        checkCuda("allocating d_input_");
 
-        // Allocate output keypoints buffer
-        size_t keypoints_size = BATCH_SIZE * max_keypoints_ * 2 * sizeof(float);
-        cudaMalloc(&d_output_keypoints_, keypoints_size);
-        checkCuda("allocating d_output_keypoints_");
+        if (use_unified_memory_)
+        {
+            CUDA_CHECK(cudaMallocManaged(&d_input_, input_size));
+        }
+        else
+        {
+            CUDA_CHECK(cudaMalloc(&d_input_, input_size));
+        }
 
-        // Host buffers for results
+        // Host buffers for results - pre-allocate maximum sizes
         h_keypoints_.resize(BATCH_SIZE * max_keypoints_ * 2);
         h_matches_.resize(max_keypoints_ * 3);
         h_scores_.resize(max_keypoints_);
@@ -298,9 +311,9 @@ private:
     void setupBindingsAndAllocators()
     {
         context_->setTensorAddress(input_tensor_name_.c_str(), d_input_);
-        context_->setTensorAddress(output_keypoints_name_.c_str(), d_output_keypoints_);
 
-        for (const auto &name : {output_matches_name_, output_scores_name_})
+        // Use dynamic allocators for all outputs including keypoints
+        for (const auto &name : {output_keypoints_name_, output_matches_name_, output_scores_name_})
         {
             if (!name.empty())
             {
@@ -314,12 +327,25 @@ private:
     void initGPUPreprocessing()
     {
         cv_stream_ = cv::cuda::StreamAccessor::wrapStream(stream_);
+
+        // Pre-allocate GPU matrices for better performance
+        gpu_left_uploaded_.create(input_height_, input_width_, CV_8UC3);
+        gpu_right_uploaded_.create(input_height_, input_width_, CV_8UC3);
+        gpu_left_resized_.create(input_height_, input_width_, CV_8UC3);
+        gpu_right_resized_.create(input_height_, input_width_, CV_8UC3);
+        gpu_left_gray_.create(input_height_, input_width_, CV_8UC1);
+        gpu_right_gray_.create(input_height_, input_width_, CV_8UC1);
+        gpu_left_norm_fp32_.create(input_height_, input_width_, CV_32F);
+        gpu_right_norm_fp32_.create(input_height_, input_width_, CV_32F);
     }
 
-    // https://www.dotndash.net/2023/03/09/using-tensorrt-with-opencv-cuda.html
     void preprocessGPU(const cv::Mat &left_img, const cv::Mat &right_img, bool is_grayscale)
     {
-        // Upload to GPU
+        if (profile_inference_)
+        {
+            preprocess_start_ = std::chrono::high_resolution_clock::now();
+        }
+
         gpu_left_uploaded_.upload(left_img, cv_stream_);
         gpu_right_uploaded_.upload(right_img, cv_stream_);
 
@@ -327,7 +353,7 @@ private:
         if (gpu_left_uploaded_.cols != input_width_ || gpu_left_uploaded_.rows != input_height_)
         {
             cv::cuda::resize(gpu_left_uploaded_, gpu_left_resized_,
-                           cv::Size(input_width_, input_height_), 0, 0, cv::INTER_LINEAR, cv_stream_);
+                             cv::Size(input_width_, input_height_), 0, 0, cv::INTER_LINEAR, cv_stream_);
         }
         else
         {
@@ -337,7 +363,7 @@ private:
         if (gpu_right_uploaded_.cols != input_width_ || gpu_right_uploaded_.rows != input_height_)
         {
             cv::cuda::resize(gpu_right_uploaded_, gpu_right_resized_,
-                           cv::Size(input_width_, input_height_), 0, 0, cv::INTER_LINEAR, cv_stream_);
+                             cv::Size(input_width_, input_height_), 0, 0, cv::INTER_LINEAR, cv_stream_);
         }
         else
         {
@@ -361,20 +387,33 @@ private:
         right_gray_ptr->convertTo(gpu_right_norm_fp32_, CV_32F, 1.0 / 255.0, cv_stream_);
 
         // Convert HWC to NCHW format for TensorRT
-        launchHWCToNCHWConversion(gpu_left_norm_fp32_, gpu_right_norm_fp32_, 
-                                 static_cast<float *>(d_input_),
-                                 input_height_, input_width_, stream_);
+        launchHWCToNCHWConversion(gpu_left_norm_fp32_, gpu_right_norm_fp32_,
+                                  static_cast<float *>(d_input_),
+                                  input_height_, input_width_, stream_);
+
+        if (profile_inference_)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(stream_));
+            auto preprocess_end = std::chrono::high_resolution_clock::now();
+            auto preprocess_time = std::chrono::duration_cast<std::chrono::microseconds>(preprocess_end - preprocess_start_).count() / 1000.0;
+            RCLCPP_INFO(this->get_logger(), "GPU Preprocessing: %.2f ms", preprocess_time);
+        }
     }
 
     void preprocessCPU(const cv::Mat &left_img, const cv::Mat &right_img, float *output, bool is_grayscale)
     {
+        if (profile_inference_)
+        {
+            preprocess_start_ = std::chrono::high_resolution_clock::now();
+        }
+
         const int image_area = input_height_ * input_width_;
         std::vector<cv::Mat> processed_images;
-        
-        for (const auto& img : {left_img, right_img})
+
+        for (const auto &img : {left_img, right_img})
         {
             cv::Mat resized, gray, normalized;
-            
+
             // Resize if needed
             if (img.cols != input_width_ || img.rows != input_height_)
             {
@@ -384,7 +423,7 @@ private:
             {
                 resized = img;
             }
-            
+
             // Convert to grayscale if needed
             if (!is_grayscale)
             {
@@ -394,7 +433,7 @@ private:
             {
                 gray = resized;
             }
-            
+
             // Normalize to [0,1] range
             gray.convertTo(normalized, CV_32F, 1.0f / 255.0f);
             processed_images.push_back(normalized);
@@ -403,9 +442,16 @@ private:
         // Convert to NCHW format (B=2, C=1, H, W)
         for (size_t b = 0; b < 2; ++b)
         {
-            const float* img_data = processed_images[b].ptr<float>();
-            float* output_ptr = output + b * image_area;
+            const float *img_data = processed_images[b].ptr<float>();
+            float *output_ptr = output + b * image_area;
             memcpy(output_ptr, img_data, image_area * sizeof(float));
+        }
+
+        if (profile_inference_)
+        {
+            auto preprocess_end = std::chrono::high_resolution_clock::now();
+            auto preprocess_time = std::chrono::duration_cast<std::chrono::microseconds>(preprocess_end - preprocess_start_).count() / 1000.0;
+            RCLCPP_INFO(this->get_logger(), "CPU Preprocessing: %.2f ms", preprocess_time);
         }
     }
 
@@ -416,7 +462,7 @@ private:
         if (!shouldProcessFrame())
             return;
         processing_.store(true);
-        auto start = std::chrono::high_resolution_clock::now();
+        auto pipeline_start = std::chrono::high_resolution_clock::now();
 
         try
         {
@@ -433,6 +479,7 @@ private:
                 return;
             }
 
+            // Preprocessing
             if (use_gpu_preprocessing_)
             {
                 preprocessGPU(left_cv->image, right_cv->image, is_grayscale);
@@ -441,9 +488,10 @@ private:
             {
                 std::vector<float> h_input(BATCH_SIZE * CHANNELS * input_height_ * input_width_);
                 preprocessCPU(left_cv->image, right_cv->image, h_input.data(), is_grayscale);
-                cudaMemcpyAsync(d_input_, h_input.data(), h_input.size() * sizeof(float), cudaMemcpyHostToDevice, stream_);
+                CUDA_CHECK(cudaMemcpyAsync(d_input_, h_input.data(), h_input.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
             }
 
+            // Set input shape
             nvinfer1::Dims input_dims;
             input_dims.nbDims = 4;
             input_dims.d[0] = BATCH_SIZE;
@@ -458,12 +506,32 @@ private:
                 return;
             }
 
+            // Inference
+            if (profile_inference_)
+            {
+                inference_start_ = std::chrono::high_resolution_clock::now();
+            }
+
             if (!context_->enqueueV3(stream_))
             {
                 RCLCPP_ERROR(this->get_logger(), "Failed to enqueue inference");
                 processing_.store(false);
                 return;
             }
+
+            if (profile_inference_)
+            {
+                CUDA_CHECK(cudaStreamSynchronize(stream_));
+                auto inference_end = std::chrono::high_resolution_clock::now();
+                auto inference_time = std::chrono::duration_cast<std::chrono::microseconds>(inference_end - inference_start_).count() / 1000.0;
+                RCLCPP_INFO(this->get_logger(), "Inference: %.2f ms", inference_time);
+            }
+
+            // Get dynamic output information
+            auto &keypoints_allocator = mAllocatorMap.at(output_keypoints_name_);
+            auto keypoints_dims = keypoints_allocator->getShape();
+            actual_num_keypoints_ = keypoints_dims.nbDims > 1 ? keypoints_dims.d[1] : max_keypoints_;
+            void *d_keypoints_ptr = keypoints_allocator->getBuffer();
 
             auto &matches_allocator = mAllocatorMap.at(output_matches_name_);
             auto matches_dims = matches_allocator->getShape();
@@ -473,28 +541,34 @@ private:
             auto &scores_allocator = mAllocatorMap.at(output_scores_name_);
             void *d_scores_ptr = scores_allocator->getBuffer();
 
-            cudaMemcpyAsync(h_keypoints_.data(), d_output_keypoints_,
-                            BATCH_SIZE * max_keypoints_ * 2 * sizeof(float),
-                            cudaMemcpyDeviceToHost, stream_);
+            // Copy results to host
+            if (actual_num_keypoints_ > 0)
+            {
+                size_t keypoints_size = BATCH_SIZE * actual_num_keypoints_ * 2 * sizeof(float);
+                CUDA_CHECK(cudaMemcpyAsync(h_keypoints_.data(), d_keypoints_ptr, keypoints_size, cudaMemcpyDeviceToHost, stream_));
+            }
 
             if (actual_num_matches_ > 0)
             {
                 size_t max_host_matches = h_matches_.size() / 3;
                 if (actual_num_matches_ > static_cast<int>(max_host_matches))
                 {
-                    RCLCPP_WARN(this->get_logger(), "Model produced more matches (%d) than host buffer capacity (%zu). Truncating.", actual_num_matches_, max_host_matches);
+                    RCLCPP_WARN(this->get_logger(), "Model produced more matches (%d) than host buffer capacity (%zu). Truncating.",
+                                actual_num_matches_, max_host_matches);
                     actual_num_matches_ = max_host_matches;
                 }
-                cudaMemcpyAsync(h_matches_.data(), d_matches_ptr, actual_num_matches_ * 3 * sizeof(int), cudaMemcpyDeviceToHost, stream_);
-                cudaMemcpyAsync(h_scores_.data(), d_scores_ptr, actual_num_matches_ * sizeof(float), cudaMemcpyDeviceToHost, stream_);
+                CUDA_CHECK(cudaMemcpyAsync(h_matches_.data(), d_matches_ptr, actual_num_matches_ * 3 * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+                CUDA_CHECK(cudaMemcpyAsync(h_scores_.data(), d_scores_ptr, actual_num_matches_ * sizeof(float), cudaMemcpyDeviceToHost, stream_));
             }
 
-            cudaStreamSynchronize(stream_);
+            CUDA_CHECK(cudaStreamSynchronize(stream_));
 
-            auto end = std::chrono::high_resolution_clock::now();
+            auto pipeline_end = std::chrono::high_resolution_clock::now();
             if (profile_inference_)
             {
-                RCLCPP_INFO(this->get_logger(), "Total pipeline: %.2f ms", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0);
+                auto total_time = std::chrono::duration_cast<std::chrono::microseconds>(pipeline_end - pipeline_start).count() / 1000.0;
+                RCLCPP_INFO(this->get_logger(), "Total pipeline: %.2f ms, Keypoints: %d, Matches: %d",
+                            total_time, actual_num_keypoints_, actual_num_matches_);
             }
 
             processAndPublishResults(left_cv->image, right_cv->image, left_msg->header);
@@ -675,8 +749,6 @@ private:
     {
         if (d_input_)
             cudaFree(d_input_);
-        if (d_output_keypoints_)
-            cudaFree(d_output_keypoints_);
         if (stream_)
             cudaStreamDestroy(stream_);
     }
