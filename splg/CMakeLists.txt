@@ -56,6 +56,7 @@ target_include_directories(splg_node PRIVATE
 target_link_libraries(splg_node
   CUDA::cudart
   CUDA::cuda_driver
+  nvToolsExt
   ${TENSORRT_LIBRARY_INFER}
   ${TENSORRT_LIBRARY_ONNXPARSER}
   ${OpenCV_LIBRARIES}

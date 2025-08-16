@@ -7,7 +7,7 @@ def generate_launch_description():
     # Get package directory
     pkg_dir = get_package_share_directory('splg')
     weights_dir = os.path.join(pkg_dir, 'weights')
-    engine_path = os.path.join(weights_dir, 'superpoint_lightglue_pipeline_b2_h400_w640_kp512.engine')
+    engine_path = os.path.join(weights_dir, 'superpoint_lightglue_b2_h400_w640_kp256.engine')
     
     # Create node
     splg_node = Node(
@@ -19,7 +19,7 @@ def generate_launch_description():
                 'engine_path': engine_path,
                 'input_height': 400,
                 'input_width': 640,
-                'max_keypoints': 512,
+                'max_keypoints': 256,
                 'profile_inference': True,
                 'use_gpu_preprocessing': True,
                 'frame_skip_mode': 'every_nth',  # Options: 'every_nth', 'rate_limit', 'none'
