@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>oakd_ros2_minimal</name>
+  <version>1.0.0</version>
+  <description>The minimal depthai ros</description>
+
+  <maintainer email="skl1g14@soton.ac.uk">Janitor</maintainer>
+
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>ament_cmake_auto</build_depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>rclpy</depend>
+  <depend>cv_bridge</depend>
+  <depend>camera_info_manager</depend>
+  <depend>depthai</depend>
+  <depend>depthai_ros_msgs</depend>
+  <depend>depthai_bridge</depend>
+  <depend>depthai_descriptions</depend>
+  <depend>image_transport</depend>
+  <depend>libopencv-dev</depend>
+  <depend>ros_environment</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>stereo_msgs</depend>
+  <depend>vision_msgs</depend>
+  <depend>message_filters</depend>
+
+  <exec_depend>image_transport_plugins</exec_depend>
+  <exec_depend>compressed_image_transport</exec_depend>
+  <exec_depend>compressed_depth_image_transport</exec_depend>
+  <exec_depend>theora_image_transport</exec_depend>
+
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+
+</package>
